@@ -12,17 +12,7 @@
 # governing permissions and limitations under the License.
 
 """Module chooses a proper worker class."""
-import warnings
+from .base_worker import DbTable
+from .hdk_worker import HdkWorker as DbWorker
 
-try:
-    # Try to use PyHDK by default
-    from .hdk_worker import HdkWorker as DbWorker
-except ModuleNotFoundError:  # fallback to pyomniscidbe package
-    from .omnisci_worker import OmnisciWorker as DbWorker
-
-    warnings.warn(
-        "The OmniSci backend has been deprecated. "
-        + 'Please use `StorageFormat.put("hdk")` or `MODIN_STORAGE_FORMAT="hdk"` instead.'
-    )
-
-__all__ = ["DbWorker"]
+__all__ = ["DbTable", "DbWorker"]

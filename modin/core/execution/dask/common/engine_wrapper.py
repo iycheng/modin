@@ -15,6 +15,8 @@
 
 from collections import UserDict
 
+from dask.distributed import wait
+from distributed import Future
 from distributed.client import default_client
 
 
@@ -90,6 +92,23 @@ class DaskWrapper:
         return remote_task_future
 
     @classmethod
+    def is_future(cls, item):
+        """
+        Check if the item is a Future.
+
+        Parameters
+        ----------
+        item : distributed.Future or object
+            Future or object to check.
+
+        Returns
+        -------
+        boolean
+            If the value is a future.
+        """
+        return isinstance(item, Future)
+
+    @classmethod
     def materialize(cls, future):
         """
         Materialize data matching `future` object.
@@ -133,3 +152,29 @@ class DaskWrapper:
             data = UserDict(data)
         client = default_client()
         return client.scatter(data, **kwargs)
+
+    @classmethod
+    def wait(cls, obj_ids, num_returns=None):
+        """
+        Wait on the objects without materializing them (blocking operation).
+
+        Parameters
+        ----------
+        obj_ids : list, scalar
+        num_returns : int, optional
+        """
+        if not isinstance(obj_ids, list):
+            obj_ids = [obj_ids]
+        if num_returns is None:
+            num_returns = len(obj_ids)
+        if num_returns == len(obj_ids):
+            wait(obj_ids, return_when="ALL_COMPLETED")
+        else:
+            # Dask doesn't natively support `num_returns` as int.
+            # `wait` function doesn't always return only one finished future,
+            # so a simple loop is not enough here
+            done, not_done = wait(obj_ids, return_when="FIRST_COMPLETED")
+            while len(done) < num_returns and (i := 0 < num_returns):
+                extra_done, not_done = wait(not_done, return_when="FIRST_COMPLETED")
+                done.update(extra_done)
+                i += 1

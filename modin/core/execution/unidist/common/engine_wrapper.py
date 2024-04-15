@@ -18,6 +18,7 @@ To be used as a piece of building a unidist-based engine.
 """
 
 import asyncio
+
 import unidist
 
 
@@ -74,6 +75,23 @@ class UnidistWrapper:
         )
 
     @classmethod
+    def is_future(cls, item):
+        """
+        Check if the item is a Future.
+
+        Parameters
+        ----------
+        item : unidist.ObjectRef or object
+            Future or object to check.
+
+        Returns
+        -------
+        boolean
+            If the value is a future.
+        """
+        return unidist.is_object_ref(item)
+
+    @classmethod
     def materialize(cls, obj_id):
         """
         Get the value of object from the object store.
@@ -108,6 +126,26 @@ class UnidistWrapper:
             A reference to `data`.
         """
         return unidist.put(data)
+
+    @classmethod
+    def wait(cls, obj_ids, num_returns=None):
+        """
+        Wait on the objects without materializing them (blocking operation).
+
+        ``unidist.wait`` assumes a list of unique object references: see
+        https://github.com/modin-project/modin/issues/5045
+
+        Parameters
+        ----------
+        obj_ids : list, scalar
+        num_returns : int, optional
+        """
+        if not isinstance(obj_ids, list):
+            obj_ids = [obj_ids]
+        unique_ids = list(set(obj_ids))
+        if num_returns is None:
+            num_returns = len(unique_ids)
+        unidist.wait(unique_ids, num_returns=num_returns)
 
 
 @unidist.remote

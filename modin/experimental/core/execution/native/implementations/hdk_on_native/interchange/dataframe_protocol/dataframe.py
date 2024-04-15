@@ -14,25 +14,27 @@
 """The module houses HdkOnNative implementation of the Dataframe class of DataFrame exchange protocol."""
 
 import collections
+from typing import Any, Dict, Iterable, Optional, Sequence
+
 import numpy as np
 import pyarrow as pa
-from typing import Optional, Iterable, Sequence, Dict, Any
 
-from modin.experimental.core.execution.native.implementations.hdk_on_native.dataframe.dataframe import (
-    HdkOnNativeDataframe,
-)
 from modin.core.dataframe.base.interchange.dataframe_protocol.dataframe import (
     ProtocolDataframe,
 )
-from modin.pandas.indexing import is_range_like
-from modin.utils import _inherit_docstrings
 from modin.error_message import ErrorMessage
+from modin.experimental.core.execution.native.implementations.hdk_on_native.dataframe.dataframe import (
+    HdkOnNativeDataframe,
+)
 from modin.experimental.core.execution.native.implementations.hdk_on_native.df_algebra import (
-    MaskNode,
     FrameNode,
+    MaskNode,
     TransformNode,
     UnionNode,
 )
+from modin.pandas.indexing import is_range_like
+from modin.utils import _inherit_docstrings
+
 from .column import HdkProtocolColumn
 from .utils import raise_copy_alert_if_materialize
 
@@ -185,13 +187,13 @@ class HdkProtocolDataframe(ProtocolDataframe):
         is_zero_copy_op = False
         if isinstance(op, (FrameNode, TransformNode, UnionNode)):
             # - FrameNode: already materialized PyArrow table
-            # - TransformNode: select certain columns of the table, implemented zero-copy (``df._arrow_select``)
-            # - UnionNode: concatenate PyArrow tables, implemented zero-copy (``df._arrow_concat``)
+            # - TransformNode: select certain columns of the table, implemented zero-copy
+            # - UnionNode: concatenate PyArrow tables, implemented zero-copy
             is_zero_copy_op = True
         elif isinstance(op, MaskNode) and (
             isinstance(op.row_positions, slice) or is_range_like(op.row_positions)
         ):
-            # Can select rows zero-copy if indexer is a slice-like (``df._arrow_row_slice``)
+            # Can select rows zero-copy if indexer is a slice-like
             is_zero_copy_op = True
         return is_zero_copy_op and all(
             # Walk the computation tree
@@ -209,10 +211,9 @@ class HdkProtocolDataframe(ProtocolDataframe):
         -------
         pyarrow.Table
         """
-        if not self._df._has_arrow_table():
-            self._df._execute()
-
-        at = self._df._partitions[0][0].arrow_table
+        at = self._df._execute()
+        if not isinstance(at, pa.Table):
+            at = at.to_arrow()
         assert at is not None
         return at
 

@@ -15,13 +15,20 @@
 # type: ignore
 
 import os
-import sys
-import pytest
-import pandas
-from pandas.util._decorators import doc
-import numpy as np
+import platform
 import shutil
+import subprocess
+import sys
+import time
 from typing import Optional
+
+import boto3
+import numpy as np
+import pandas
+import pytest
+import requests
+import s3fs
+from pandas.util._decorators import doc
 
 assert (
     "modin.utils" not in sys.modules
@@ -43,126 +50,46 @@ def _saving_make_api_url(token, _make_api_url=modin.utils._make_api_url):
 
 modin.utils._make_api_url = _saving_make_api_url
 
-import modin  # noqa: E402
-import modin.config  # noqa: E402
-from modin.config import (  # noqa: E402
-    NPartitions,
-    MinPartitionSize,
-    IsExperimental,
-    TestRayClient,
-)
 import uuid  # noqa: E402
 
-from modin.core.storage_formats import (  # noqa: E402
-    PandasQueryCompiler,
-    BaseQueryCompiler,
+import modin  # noqa: E402
+import modin.config  # noqa: E402
+import modin.tests.config  # noqa: E402
+from modin.config import (  # noqa: E402
+    AsyncReadMode,
+    BenchmarkMode,
+    GithubCI,
+    IsExperimental,
+    MinPartitionSize,
+    NPartitions,
 )
+from modin.core.execution.dispatching.factories import factories  # noqa: E402
 from modin.core.execution.python.implementations.pandas_on_python.io import (  # noqa: E402
     PandasOnPythonIO,
 )
-from modin.core.execution.dispatching.factories import factories  # noqa: E402
-from modin.utils import get_current_execution  # noqa: E402
-from modin.pandas.test.utils import (  # noqa: E402
+from modin.core.storage_formats import (  # noqa: E402
+    BaseQueryCompiler,
+    PandasQueryCompiler,
+)
+from modin.tests.pandas.utils import (  # noqa: E402
+    NROWS,
     _make_csv_file,
     get_unique_filename,
     make_default_file,
-    teardown_test_files,
-    NROWS,
 )
 
 
 def pytest_addoption(parser):
-    parser.addoption(
-        "--simulate-cloud",
-        action="store",
-        default="off",
-        help="simulate cloud for testing: off|normal|experimental",
-    )
     parser.addoption(
         "--execution",
         action="store",
         default=None,
         help="specifies execution to run tests on",
     )
-    parser.addoption(
-        "--extra-test-parameters",
-        action="store_true",
-        help="activate extra test parameter combinations",
-        default=False,
-    )
-
-
-class Patcher:
-    def __init__(self, conn, *pairs):
-        self.pairs = pairs
-        self.originals = None
-        self.conn = conn
-
-    def __wrap(self, func):
-        def wrapper(*a, **kw):
-            return func(
-                *(tuple(self.conn.obtain(x) for x in a)),
-                **({k: self.conn.obtain(v) for k, v in kw.items()}),
-            )
-
-        return func, wrapper
-
-    def __enter__(self):
-        self.originals = []
-        for module, attrname in self.pairs:
-            orig, wrapped = self.__wrap(getattr(module, attrname))
-            self.originals.append((module, attrname, orig))
-            setattr(module, attrname, wrapped)
-        return self
-
-    def __exit__(self, *a, **kw):
-        for module, attrname, orig in self.originals:
-            setattr(module, attrname, orig)
 
 
 def set_experimental_env(mode):
-    from modin.config import IsExperimental
-
     IsExperimental.put(mode == "experimental")
-
-
-@pytest.fixture(scope="session", autouse=True)
-def simulate_cloud(request):
-    mode = request.config.getoption("--simulate-cloud").lower()
-    if mode == "off":
-        yield
-        return
-    if (
-        request.config.getoption("usepdb")
-        and request.config.getoption("capture") != "no"
-    ):
-        with request.config.pluginmanager.getplugin(
-            "capturemanager"
-        ).global_and_fixture_disabled():
-            sys.stderr.write(
-                "WARNING! You're running tests in simulate-cloud mode. "
-                + "To enable pdb in remote side please disable output capturing "
-                + "by passing '-s' or '--capture=no' to pytest command line\n"
-            )
-
-    if mode not in ("normal", "experimental"):
-        raise ValueError(f"Unsupported --simulate-cloud mode: {mode}")
-    assert IsExperimental.get(), "Simulated cloud must be started in experimental mode"
-
-    from modin.experimental.cloud import create_cluster, get_connection
-    import modin.pandas.test.utils
-
-    with create_cluster("local", cluster_type="local"):
-        get_connection().teleport(set_experimental_env)(mode)
-        with Patcher(
-            get_connection(),
-            (modin.pandas.test.utils, "assert_index_equal"),
-            (modin.pandas.test.utils, "assert_series_equal"),
-            (modin.pandas.test.utils, "assert_frame_equal"),
-            (modin.pandas.test.utils, "assert_extension_array_equal"),
-            (modin.pandas.test.utils, "assert_empty_frame_equal"),
-        ):
-            yield
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -173,7 +100,10 @@ def enforce_config():
     """
     orig_env = os.environ
     modin_start = os.path.dirname(modin.__file__)
-    modin_exclude = [os.path.dirname(modin.config.__file__)]
+    modin_exclude = [
+        os.path.dirname(modin.config.__file__),
+        os.path.dirname(modin.tests.config.__file__),
+    ]
 
     class PatchedEnv:
         @staticmethod
@@ -237,6 +167,10 @@ class TestQC(BaseQueryCompiler):
 
     def finalize(self):
         self._modin_frame.finalize()
+
+    def execute(self):
+        self.finalize()
+        self._modin_frame.wait_computations()
 
     @classmethod
     def from_pandas(cls, df, data_cls):
@@ -315,10 +249,6 @@ def get_unique_base_execution():
 
 
 def pytest_configure(config):
-    import modin.pandas.test.utils as utils
-
-    utils.extra_test_parameters = config.getoption("--extra-test-parameters")
-
     execution = config.option.execution
 
     if execution is None:
@@ -344,7 +274,7 @@ def pytest_runtest_call(item):
             if not isinstance(executions, list):
                 executions = [executions]
 
-            current_execution = get_current_execution()
+            current_execution = modin.utils.get_current_execution()
             reason = marker.kwargs.pop("reason", "")
 
             item.add_marker(
@@ -365,65 +295,44 @@ Yields:
 
 
 @pytest.fixture(scope="class")
-def TestReadCSVFixture():
-    filenames = []
-    files_ids = [
-        "test_read_csv_regular",
-        "test_read_csv_blank_lines",
-        "test_read_csv_yes_no",
-        "test_read_csv_nans",
-        "test_read_csv_bad_lines",
-    ]
+def TestReadCSVFixture(tmp_path_factory):
+    tmp_path = tmp_path_factory.mktemp("TestReadCSVFixture")
+
+    creator = _make_csv_file(data_dir=tmp_path)
     # each xdist worker spawned in separate process with separate namespace and dataset
-    pytest.csvs_names = {file_id: get_unique_filename() for file_id in files_ids}
+    pytest.csvs_names = {}
     # test_read_csv_col_handling, test_read_csv_parsing
-    _make_csv_file(filenames)(
-        filename=pytest.csvs_names["test_read_csv_regular"],
-    )
+    pytest.csvs_names["test_read_csv_regular"] = creator()
     # test_read_csv_parsing
-    _make_csv_file(filenames)(
-        filename=pytest.csvs_names["test_read_csv_yes_no"],
+    pytest.csvs_names["test_read_csv_yes_no"] = creator(
         additional_col_values=["Yes", "true", "No", "false"],
     )
     # test_read_csv_col_handling
-    _make_csv_file(filenames)(
-        filename=pytest.csvs_names["test_read_csv_blank_lines"],
+    pytest.csvs_names["test_read_csv_blank_lines"] = creator(
         add_blank_lines=True,
     )
     # test_read_csv_nans_handling
-    _make_csv_file(filenames)(
-        filename=pytest.csvs_names["test_read_csv_nans"],
+    pytest.csvs_names["test_read_csv_nans"] = creator(
         add_blank_lines=True,
         additional_col_values=["<NA>", "N/A", "NA", "NULL", "custom_nan", "73"],
     )
     # test_read_csv_error_handling
-    _make_csv_file(filenames)(
-        filename=pytest.csvs_names["test_read_csv_bad_lines"],
+    pytest.csvs_names["test_read_csv_bad_lines"] = creator(
         add_bad_lines=True,
     )
-
     yield
-    # Delete csv files that were created
-    teardown_test_files(filenames)
 
 
 @pytest.fixture
 @doc(_doc_pytest_fixture, file_type="csv")
-def make_csv_file():
-    filenames = []
-
-    yield _make_csv_file(filenames)
-
-    # Delete csv files that were created
-    teardown_test_files(filenames)
+def make_csv_file(tmp_path):
+    yield _make_csv_file(data_dir=tmp_path)
 
 
 def create_fixture(file_type):
     @doc(_doc_pytest_fixture, file_type=file_type)
-    def fixture():
-        func, filenames = make_default_file(file_type=file_type)
-        yield func
-        teardown_test_files(filenames)
+    def fixture(tmp_path):
+        yield make_default_file(file_type=file_type, data_dir=tmp_path)
 
     return fixture
 
@@ -448,6 +357,9 @@ def make_parquet_file():
         nrows=NROWS,
         ncols=2,
         force=True,
+        range_index_start=0,
+        range_index_step=1,
+        range_index_name=None,
         partitioned_columns=[],
         row_group_size: Optional[int] = None,
     ):
@@ -465,6 +377,20 @@ def make_parquet_file():
             df = pandas.DataFrame(
                 {f"col{x + 1}": np.arange(nrows) for x in range(ncols)}
             )
+            index = pandas.RangeIndex(
+                start=range_index_start,
+                stop=range_index_start + (nrows * range_index_step),
+                step=range_index_step,
+                name=range_index_name,
+            )
+            if (
+                range_index_start == 0
+                and range_index_step == 1
+                and range_index_name is None
+            ):
+                assert df.index.equals(index)
+            else:
+                df.index = index
             if len(partitioned_columns) > 0:
                 df.to_parquet(
                     filename,
@@ -494,13 +420,11 @@ def make_sql_connection():
     Yields:
         Factory that generates sql connection objects
     """
-    filenames = []
 
     def _sql_connection(filename, table=""):
         # Remove file if exists
         if os.path.exists(filename):
             os.remove(filename)
-        filenames.append(filename)
         # Create connection and, if needed, table
         conn = "sqlite:///{}".format(filename)
         if table:
@@ -520,19 +444,17 @@ def make_sql_connection():
 
 
 @pytest.fixture(scope="class")
-def TestReadGlobCSVFixture():
-    filenames = []
+def TestReadGlobCSVFixture(tmp_path_factory):
+    tmp_path = tmp_path_factory.mktemp("TestReadGlobCSVFixture")
 
     base_name = get_unique_filename(extension="")
-    pytest.glob_path = "{}_*.csv".format(base_name)
-    pytest.files = ["{}_{}.csv".format(base_name, i) for i in range(11)]
+    pytest.glob_path = str(tmp_path / "{}_*.csv".format(base_name))
+    pytest.files = [str(tmp_path / "{}_{}.csv".format(base_name, i)) for i in range(11)]
     for fname in pytest.files:
         # Glob does not guarantee ordering so we have to remove the randomness in the generated csvs.
-        _make_csv_file(filenames)(fname, row_size=11, remove_randomness=True)
+        _make_csv_file(data_dir=tmp_path)(fname, row_size=11, remove_randomness=True)
 
     yield
-
-    teardown_test_files(filenames)
 
 
 @pytest.fixture
@@ -548,6 +470,22 @@ def set_num_partitions(request):
     NPartitions.put(old_num_partitions)
 
 
+@pytest.fixture()
+def set_benchmark_mode(request):
+    old_benchmark_mode = BenchmarkMode.get()
+    BenchmarkMode.put(request.param)
+    yield
+    BenchmarkMode.put(old_benchmark_mode)
+
+
+@pytest.fixture
+def set_async_read_mode(request):
+    old_async_read_mode = AsyncReadMode.get()
+    AsyncReadMode.put(request.param)
+    yield
+    AsyncReadMode.put(old_async_read_mode)
+
+
 @pytest.fixture
 def set_min_partition_size(request):
     old_min_partition_size = MinPartitionSize.get()
@@ -559,21 +497,204 @@ def set_min_partition_size(request):
 ray_client_server = None
 
 
-def pytest_sessionstart(session):
-    if TestRayClient.get():
-        import ray
-        import ray.util.client.server.server as ray_server
+@pytest.fixture
+def s3_storage_options(worker_id):
+    # # copied from pandas conftest.py:
+    # https://github.com/pandas-dev/pandas/blob/32f789fbc5d5a72d9d1ac14935635289eeac9009/pandas/tests/io/conftest.py#L45
+    # worker_id is a pytest fixture
+    if GithubCI.get():
+        url = "http://localhost:5000/"
+    else:
+        # If we hit this else-case, this test is being run locally. In that case, we want
+        # each worker to point to a different port for its mock S3 service. The easiest way
+        # to do that is to use the `worker_id`, which is unique, to determine what port to point
+        # to. We arbitrarily assign `5` as a worker id to the master worker, since we need a number
+        # for each worker, and we never run tests with more than `pytest -n 4`.
+        worker_id = "5" if worker_id == "master" else worker_id.lstrip("gw")
+        url = f"http://127.0.0.1:555{worker_id}/"
+    return {"client_kwargs": {"endpoint_url": url}}
 
-        addr = "localhost:50051"
-        global ray_client_server
-        ray_client_server = ray_server.serve(addr)
-        ray.util.connect(addr)
+
+@pytest.fixture(scope="session")
+def monkeysession():
+    with pytest.MonkeyPatch.context() as mp:
+        yield mp
 
 
-def pytest_sessionfinish(session, exitstatus):
-    if TestRayClient.get():
-        import ray
+@pytest.fixture(scope="session")
+def s3_base(worker_id, monkeysession):
+    """
+    Fixture for mocking S3 interaction.
 
-        ray.util.disconnect()
-        if ray_client_server:
-            ray_client_server.stop(0)
+    Sets up moto server in separate process locally.
+
+    Yields
+    ------
+    str
+        URL for motoserver/moto CI service.
+    """
+    # copied from pandas conftest.py
+    # still need access keys for https://github.com/getmoto/moto/issues/1924
+    monkeysession.setenv("AWS_ACCESS_KEY_ID", "foobar_key")
+    monkeysession.setenv("AWS_SECRET_ACCESS_KEY", "foobar_secret")
+    monkeysession.setenv("AWS_REGION", "us-west-2")
+    if GithubCI.get():
+        if sys.platform in ("darwin", "win32", "cygwin") or (
+            platform.machine() in ("arm64", "aarch64")
+            or platform.machine().startswith("armv")
+        ):
+            # pandas comments say:
+            # DO NOT RUN on Windows/macOS/ARM, only Ubuntu
+            # - subprocess in CI can cause timeouts
+            # - GitHub Actions do not support
+            #   container services for the above OSs
+            pytest.skip(
+                "S3 tests do not have a corresponding service in Windows, macOS "
+                + "or ARM platforms"
+            )
+        else:
+            # assume CI has started moto in docker container:
+            # https://docs.getmoto.org/en/latest/docs/server_mode.html#run-using-docker
+            # It would be nice to start moto on another thread as in the
+            # instructions here:
+            # https://docs.getmoto.org/en/latest/docs/server_mode.html#start-within-python
+            # but that gives 403 forbidden error when we try to create the bucket
+            yield "http://localhost:5000"
+    else:
+        # Launching moto in server mode, i.e., as a separate process
+        # with an S3 endpoint on localhost
+
+        # If we hit this else-case, this test is being run locally. In that case, we want
+        # each worker to point to a different port for its mock S3 service. The easiest way
+        # to do that is to use the `worker_id`, which is unique, to determine what port to point
+        # to.
+        endpoint_port = (
+            5500 if worker_id == "master" else (5550 + int(worker_id.lstrip("gw")))
+        )
+        endpoint_uri = f"http://127.0.0.1:{endpoint_port}/"
+
+        # pipe to null to avoid logging in terminal
+        # TODO any way to throw the error from here? e.g. i had an annoying problem
+        # where I didn't have flask-cors and moto just failed .if there's an error
+        # in the popen command and we throw an error within the body of the context
+        # manager, the test just hangs forever.
+        with subprocess.Popen(
+            ["moto_server", "s3", "-p", str(endpoint_port)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        ) as proc:
+            for _ in range(50):
+                try:
+                    # OK to go once server is accepting connections
+                    if requests.get(endpoint_uri).ok:
+                        break
+                except Exception:
+                    # try again while we still have retries
+                    time.sleep(0.1)
+            else:
+                proc.terminate()
+                _, errs = proc.communicate()
+                raise RuntimeError(
+                    "Could not connect to moto server after 50 tries. "
+                    + f"See stderr for extra info: {errs}"
+                )
+            yield endpoint_uri
+
+            proc.terminate()
+
+
+@pytest.fixture
+def s3_resource(s3_base):
+    """
+    Set up S3 bucket with contents. The primary bucket name is "modin-test".
+
+    When running locally, this function should be safe even if there are multiple pytest
+    workers running in parallel because each worker gets its own endpoint. When running
+    in CI, we use a single endpoint for all workers, so we can't have multiple pytest
+    workers running in parallel.
+    """
+    bucket = "modin-test"
+    conn = boto3.resource("s3", endpoint_url=s3_base)
+    cli = boto3.client("s3", endpoint_url=s3_base)
+
+    # https://github.com/getmoto/moto/issues/3292
+    # without location, I get
+    # botocore.exceptions.ClientError: An error occurred
+    # (IllegalLocationConstraintException) when calling the CreateBucket operation:
+    # The unspecified location constraint is incompatible for the region specific
+    # endpoint this request was sent to.
+    # even if I delete os.environ['AWS_REGION'] but somehow pandas can get away with
+    # this.
+    try:
+        cli.create_bucket(
+            Bucket=bucket, CreateBucketConfiguration={"LocationConstraint": "us-west-2"}
+        )
+    except Exception as e:
+        # OK if bucket already exists, but want to raise other exceptions.
+        # The exception raised by `create_bucket` is made using a factory,
+        # so we need to check using this method of reading the response rather
+        # than just checking the type of the exception.
+        response = getattr(e, "response", {})
+        error_code = response.get("Error", {}).get("Code", "")
+        if error_code not in ("BucketAlreadyOwnedByYou", "BucketAlreadyExists"):
+            raise
+    for _ in range(20):
+        # We want to wait until bucket creation is finished.
+        if cli.list_buckets()["Buckets"]:
+            break
+        time.sleep(0.1)
+    if not cli.list_buckets()["Buckets"]:
+        raise RuntimeError("Could not create bucket")
+
+    s3fs.S3FileSystem.clear_instance_cache()
+
+    s3 = s3fs.S3FileSystem(client_kwargs={"endpoint_url": s3_base})
+
+    test_s3_files = [
+        ("modin-bugs/multiple_csv/", "modin/tests/pandas/data/multiple_csv/"),
+        (
+            "modin-bugs/test_data_dir.parquet/",
+            "modin/tests/pandas/data/test_data_dir.parquet/",
+        ),
+        ("modin-bugs/test_data.parquet", "modin/tests/pandas/data/test_data.parquet"),
+        ("modin-bugs/test_data.json", "modin/tests/pandas/data/test_data.json"),
+        ("modin-bugs/test_data.fwf", "modin/tests/pandas/data/test_data.fwf"),
+        ("modin-bugs/test_data.feather", "modin/tests/pandas/data/test_data.feather"),
+        ("modin-bugs/issue5159.parquet/", "modin/tests/pandas/data/issue5159.parquet/"),
+    ]
+    for s3_key, file_name in test_s3_files:
+        s3.put(file_name, f"{bucket}/{s3_key}", recursive=s3_key.endswith("/"))
+
+    yield conn
+
+    s3.rm(bucket, recursive=True)
+    for _ in range(20):
+        # We want to wait until the deletion finishes.
+        if not cli.list_buckets()["Buckets"]:
+            break
+        time.sleep(0.1)
+
+
+@pytest.fixture
+def modify_config(request):
+    values = request.param
+    old_values = {}
+
+    for key, value in values.items():
+        old_values[key] = key.get()
+        key.put(value)
+
+    yield  # waiting for the test to be completed
+    # restoring old parameters
+    for key, value in old_values.items():
+        try:
+            key.put(value)
+        except ValueError as e:
+            # sometimes bool env variables have 'None' as a default value, which
+            # causes a ValueError when we try to set this value back, as technically,
+            # only bool values are allowed (and 'None' is not a bool), in this case
+            # we try to set 'False' instead
+            if key.type == bool and value is None:
+                key.put(False)
+            else:
+                raise e

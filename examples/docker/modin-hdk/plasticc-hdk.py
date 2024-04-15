@@ -12,24 +12,17 @@
 # governing permissions and limitations under the License.
 
 import sys
-from collections import OrderedDict
 from functools import partial
-from utils import measure
-import modin.pandas as pd
 
 import numpy as np
-import xgboost as xgb
+from utils import measure
 
-import sklearnex
-
-sklearnex.patch_sklearn()
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import LabelEncoder
+import modin.pandas as pd
 
 
 ################ helper functions ###############################
 def create_dtypes():
-    dtypes = OrderedDict(
+    dtypes = dict(
         [
             ("object_id", "int32"),
             ("mjd", "float32"),
@@ -56,7 +49,7 @@ def create_dtypes():
         "target",
     ]
     meta_dtypes = ["int32"] + ["float32"] * 4 + ["int32"] + ["float32"] * 5 + ["int32"]
-    meta_dtypes = OrderedDict(
+    meta_dtypes = dict(
         [(columns_names[i], meta_dtypes[i]) for i in range(len(meta_dtypes))]
     )
     return dtypes, meta_dtypes
@@ -81,6 +74,9 @@ def all_etl(train, train_meta, test, test_meta):
 
 
 def split_step(train_final, test_final):
+    from sklearn.model_selection import train_test_split
+    from sklearn.preprocessing import LabelEncoder
+
     X = train_final.drop(["object_id", "target"], axis=1).values
     Xt = test_final.drop(["object_id"], axis=1).values
 
@@ -197,6 +193,12 @@ def etl(df, df_meta):
 
 
 def ml(train_final, test_final):
+    # to not install ML dependencies unless required
+    import sklearnex
+    import xgboost as xgb
+
+    sklearnex.patch_sklearn()
+
     X_train, y_train, X_test, y_test, Xt, classes, class_weights = split_step(
         train_final, test_final
     )

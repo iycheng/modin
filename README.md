@@ -5,7 +5,7 @@
 
 | <h3>Dev Community & Support</h3> | <h3>Forums</h3> | <h3>Socials</h3> | <h3>Docs</h3> |
 |:---: | :---: | :---: | :---: |
-| [![Slack](https://img.shields.io/badge/Slack-4A154B?style=for-the-badge&logo=slack&logoColor=white)](https://join.slack.com/t/modin-project/shared_invite/zt-yvk5hr3b-f08p_ulbuRWsAfg9rMY3uA) | [![Stack Overflow](https://img.shields.io/badge/-Stackoverflow-FE7A16?style=for-the-badge&logo=stack-overflow&logoColor=white)](https://stackoverflow.com/questions/tagged/modin) | <img alt="Twitter Follow" src="https://img.shields.io/twitter/follow/modin_project?style=social" height=28 align="center"> | <a href="https://modin.readthedocs.io/en/latest/?badge=latest"><img alt="" src="https://readthedocs.org/projects/modin/badge/?version=latest" height=28 align="center"></a> |
+| [![Slack](https://img.shields.io/badge/Slack-4A154B?style=for-the-badge&logo=slack&logoColor=white)](https://join.slack.com/t/modin-project/shared_invite/zt-yvk5hr3b-f08p_ulbuRWsAfg9rMY3uA) | [![Stack Overflow](https://img.shields.io/badge/-Stackoverflow-FE7A16?style=for-the-badge&logo=stack-overflow&logoColor=white)](https://stackoverflow.com/questions/tagged/modin) | <a href="https://twitter.com/modin_project"><img alt="Twitter Follow" src="https://img.shields.io/twitter/follow/modin_project?style=social" height=28 align="center"></a> | <a href="https://modin.readthedocs.io/en/latest/?badge=latest"><img alt="" src="https://readthedocs.org/projects/modin/badge/?version=latest" height=28 align="center"></a> |
 
 </div>
 
@@ -13,6 +13,7 @@
 <a href="https://pepy.tech/project/modin"><img src="https://static.pepy.tech/personalized-badge/modin?period=total&units=international_system&left_color=black&right_color=blue&left_text=Downloads" align="center"></a>
 <a href="https://codecov.io/gh/modin-project/modin"><img src="https://codecov.io/gh/modin-project/modin/branch/master/graph/badge.svg" align="center"/></a>
 <a href="https://github.com/modin-project/modin/actions"><img src="https://github.com/modin-project/modin/workflows/master/badge.svg" align="center"></a>
+<a href="https://github.com/modin-project/modin/actions/workflows/ci.yml?query=event%3Apush"><img src="https://github.com/modin-project/modin/actions/workflows/ci.yml/badge.svg?branch=master" align="center"></a>
 <a href="https://pypi.org/project/modin/"><img src="https://badge.fury.io/py/modin.svg" alt="PyPI version" align="center"></a>
 <a href="https://modin.org/modin-bench/#/"><img src="https://img.shields.io/badge/benchmarked%20by-asv-blue.svg" align="center"></a>
 </p>
@@ -23,10 +24,12 @@ Modin is a drop-in replacement for [pandas](https://github.com/pandas-dev/pandas
 single-threaded, Modin lets you instantly speed up your workflows by scaling pandas so it uses all of your
 cores. Modin works especially well on larger datasets, where pandas becomes painfully slow or runs
 [out of memory](https://modin.readthedocs.io/en/latest/getting_started/why_modin/out_of_core.html).
+Also, Modin comes with the [additional APIs](https://modin.readthedocs.io/en/latest/usage_guide/advanced_usage/index.html#additional-apis)
+to improve user experience.
 
 By simply replacing the import statement, Modin offers users effortless speed and scale for their pandas workflows:
 
-<img src="https://github.com/modin-project/modin/raw/7c009c747caa90554607e30b9ac2bd1b190b8c7d/docs/img/Import.gif" style="display: block;margin-left: auto;margin-right: auto;" width="100%"></img>
+<img src="https://github.com/modin-project/modin/raw/master/docs/img/Import.gif" style="display: block;margin-left: auto;margin-right: auto;" width="100%"></img>
 
 In the GIFs below, Modin (left) and pandas (right) perform *the same pandas operations* on a 2GB dataset. The only difference between the two notebook examples is the import statement. 
 
@@ -56,7 +59,7 @@ The charts below show the speedup you get by replacing pandas with Modin based o
 Modin can be installed with `pip` on Linux, Windows and MacOS:
 
 ```bash
-pip install "modin[all]" # (Recommended) Install Modin with all of Modin's currently supported engines.
+pip install "modin[all]" # (Recommended) Install Modin with Ray and Dask engines.
 ```
 
 If you want to install Modin with a specific engine, we recommend:
@@ -64,8 +67,14 @@ If you want to install Modin with a specific engine, we recommend:
 ```bash
 pip install "modin[ray]" # Install Modin dependencies and Ray.
 pip install "modin[dask]" # Install Modin dependencies and Dask.
-pip install "modin[unidist]" # Install Modin dependencies and Unidist.
+pip install "modin[mpi]" # Install Modin dependencies and MPI through unidist.
 ```
+
+To get Modin on MPI through unidist (as of unidist 0.5.0) fully working
+it is required to have a working MPI implementation installed beforehand.
+Otherwise, installation of `modin[mpi]` may fail. Refer to
+[Installing with pip](https://unidist.readthedocs.io/en/latest/installation.html#installing-with-pip)
+section of the unidist documentation for more details about installation.
 
 Modin automatically detects which engine(s) you have installed and uses that for scheduling computation.
 
@@ -73,7 +82,7 @@ Modin automatically detects which engine(s) you have installed and uses that for
 
 Installing from [conda forge](https://github.com/conda-forge/modin-feedstock) using `modin-all`
 will install Modin and four engines: [Ray](https://github.com/ray-project/ray), [Dask](https://github.com/dask/dask),
-[Unidist](https://github.com/modin-project/unidist) and [HDK](https://github.com/intel-ai/hdk).
+[MPI through unidist](https://github.com/modin-project/unidist) and [HDK](https://github.com/intel-ai/hdk).
 
 ```bash
 conda install -c conda-forge modin-all
@@ -84,9 +93,13 @@ Each engine can also be installed individually (and also as a combination of sev
 ```bash
 conda install -c conda-forge modin-ray  # Install Modin dependencies and Ray.
 conda install -c conda-forge modin-dask # Install Modin dependencies and Dask.
-conda install -c conda-forge modin-unidist # Install Modin dependencies and Unidist.
+conda install -c conda-forge modin-mpi # Install Modin dependencies and MPI through unidist.
 conda install -c conda-forge modin-hdk # Install Modin dependencies and HDK.
 ```
+
+Refer to
+[Installing with conda](https://unidist.readthedocs.io/en/latest/installation.html#installing-with-conda)
+section of the unidist documentation for more details on how to install a specific MPI implementation to run on.
 
 To speed up conda installation we recommend using libmamba solver. To do this install it in a base environment:
 
@@ -118,7 +131,7 @@ export MODIN_ENGINE=unidist # Modin will use Unidist
 ```
 
 If you want to choose the Unidist engine, you should set the additional environment 
-variable ``UNIDIST_BACKEND``, because currently Modin only supports Unidist on MPI:
+variable ``UNIDIST_BACKEND``. Currently, Modin only supports MPI through unidist:
 
 ```bash
 export UNIDIST_BACKEND=mpi # Unidist will use MPI backend
@@ -143,7 +156,7 @@ _Note: You should not change the engine after your first operation with Modin as
 
 #### Which engine should I use?
 
-On Linux, MacOS, and Windows you can install and use either Ray, Dask or Unidist. There is no knowledge required
+On Linux, MacOS, and Windows you can install and use either Ray, Dask or MPI through unidist. There is no knowledge required
 to use either of these engines as Modin abstracts away all of the complexity, so feel
 free to pick either!
 
@@ -241,7 +254,6 @@ to be modular so we can plug in different components as they develop and improve
 #### Modin Community
 
 - [Slack](https://join.slack.com/t/modin-project/shared_invite/zt-yvk5hr3b-f08p_ulbuRWsAfg9rMY3uA)
-- [Discourse](https://discuss.modin.org)
 - [Twitter](https://twitter.com/modin_project)
 - [Mailing List](https://groups.google.com/g/modin-dev)
 - [GitHub Issues](https://github.com/modin-project/modin/issues)

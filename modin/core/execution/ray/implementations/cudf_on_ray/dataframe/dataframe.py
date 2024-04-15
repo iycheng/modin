@@ -13,16 +13,17 @@
 
 """Module houses class that implements ``PandasOnRayDataframe`` class using cuDF."""
 
-from typing import List, Hashable, Optional
+from typing import Hashable, List, Optional
 
 import numpy as np
 
-from modin.error_message import ErrorMessage
-from modin.pandas.utils import check_both_not_none
+from modin.core.execution.ray.common import RayWrapper
 from modin.core.execution.ray.implementations.pandas_on_ray.dataframe import (
     PandasOnRayDataframe,
 )
-from modin.core.execution.ray.common import RayWrapper
+from modin.error_message import ErrorMessage
+from modin.pandas.utils import check_both_not_none
+
 from ..partitioning import (
     cuDFOnRayDataframePartition,
     cuDFOnRayDataframePartitionManager,
@@ -216,14 +217,14 @@ class cuDFOnRayDataframe(PandasOnRayDataframe):
                     self.column_widths,
                     col_partitions_list,
                 )
-                if self._dtypes is not None:
+                if self.has_materialized_dtypes:
                     new_dtypes = self.dtypes[col_positions]
                 else:
                     new_dtypes = None
             else:
                 new_col_widths = [len(idx) for _, idx in col_partitions_list.items()]
                 new_columns = self.columns[sorted(col_positions)]
-                if self._dtypes is not None:
+                if self.has_materialized_dtypes:
                     new_dtypes = self.dtypes.iloc[sorted(col_positions)]
                 else:
                     new_dtypes = None
@@ -233,7 +234,7 @@ class cuDFOnRayDataframe(PandasOnRayDataframe):
             }
             new_col_widths = self.column_widths
             new_columns = self.columns
-            if self._dtypes is not None:
+            if self.has_materialized_dtypes:
                 new_dtypes = self.dtypes
             else:
                 new_dtypes = None
@@ -272,16 +273,8 @@ class cuDFOnRayDataframe(PandasOnRayDataframe):
             new_dtypes,
         )
 
-        sorted_row_positions = sorted_col_positions = None
-        if row_positions is not None:
-            sorted_row_positions = sorted(row_positions)
-        if col_positions is not None:
-            sorted_col_positions = sorted(col_positions)
-
         return self._maybe_reorder_labels(
             intermediate,
             row_positions,
-            sorted_row_positions,
             col_positions,
-            sorted_col_positions,
         )

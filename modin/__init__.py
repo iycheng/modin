@@ -11,8 +11,8 @@
 # ANY KIND, either express or implied. See the License for the specific language
 # governing permissions and limitations under the License.
 
-from typing import Any, Optional, Tuple, Union, Type, TYPE_CHECKING
 import warnings
+from typing import TYPE_CHECKING, Any, Optional, Tuple, Type, Union
 
 if TYPE_CHECKING:
     from .config import Engine, StorageFormat
@@ -35,11 +35,6 @@ warnings.formatwarning = custom_formatwarning
 # Filter numpy version warnings because they are not relevant
 warnings.filterwarnings("ignore", message="numpy.dtype size changed")
 warnings.filterwarnings("ignore", message="Large object of size")
-warnings.filterwarnings(
-    "ignore",
-    message="The pandas.datetime class is deprecated and will be removed from pandas in a future version. "
-    + "Import from datetime module instead.",
-)
 
 
 def set_execution(

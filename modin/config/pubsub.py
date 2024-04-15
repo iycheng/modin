@@ -13,9 +13,82 @@
 
 """Module houses ``Parameter`` class - base class for all configs."""
 
+import contextlib
+import warnings
 from collections import defaultdict
 from enum import IntEnum
-from typing import Any, Callable, DefaultDict, NamedTuple, Optional, Tuple
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    DefaultDict,
+    Iterator,
+    NamedTuple,
+    Optional,
+    Tuple,
+    cast,
+)
+
+if TYPE_CHECKING:
+    from modin.config.envvars import EnvironmentVariable
+
+
+class DeprecationDescriptor:
+    """
+    Describe deprecated parameter.
+
+    Parameters
+    ----------
+    parameter : type[Parameter]
+        Deprecated parameter.
+    new_parameter : type[Parameter], optional
+        If there's a replacement parameter for the deprecated one, specify it here.
+    when_removed : str, optional
+        If known, the exact release when the deprecated parameter is planned to be removed.
+    """
+
+    _parameter: type["Parameter"]
+    _new_parameter: Optional[type["Parameter"]]
+    _when_removed: str
+
+    def __init__(
+        self,
+        parameter: type["Parameter"],
+        new_parameter: Optional[type["Parameter"]] = None,
+        when_removed: Optional[str] = None,
+    ):
+        self._parameter = parameter
+        self._new_parameter = new_parameter
+        self._when_removed = "a future" if when_removed is None else when_removed
+
+    def deprecation_message(self, use_envvar_names: bool = False) -> str:
+        """
+        Generate a message to be used in a warning raised when using the deprecated parameter.
+
+        Parameters
+        ----------
+        use_envvar_names : bool, default: False
+            Whether to use environment variable names in the warning. If ``True``, both
+            ``self._parameter`` and ``self._new_parameter`` have to be a type of ``EnvironmentVariable``.
+
+        Returns
+        -------
+        str
+        """
+        name = (
+            cast("EnvironmentVariable", self._parameter).varname
+            if use_envvar_names
+            else self._parameter.__name__
+        )
+        msg = f"'{name}' is deprecated and will be removed in {self._when_removed} version."
+        if self._new_parameter is not None:
+            new_name = (
+                cast("EnvironmentVariable", self._new_parameter).varname
+                if use_envvar_names
+                else self._new_parameter.__name__
+            )
+            msg += f" Use '{new_name}' instead."
+        return msg
 
 
 class TypeDescriptor(NamedTuple):
@@ -82,13 +155,15 @@ _TYPE_PARAMS = {
             for key_value in value.split(",")
             for key, val in [[v.strip() for v in key_value.split("=", maxsplit=1)]]
         },
-        normalize=lambda value: value
-        if isinstance(value, dict)
-        else {
-            key: int(val) if val.isdigit() else val
-            for key_value in str(value).split(",")
-            for key, val in [[v.strip() for v in key_value.split("=", maxsplit=1)]]
-        },
+        normalize=lambda value: (
+            value
+            if isinstance(value, dict)
+            else {
+                key: int(val) if val.isdigit() else val
+                for key_value in str(value).split(",")
+                for key, val in [[v.strip() for v in key_value.split("=", maxsplit=1)]]
+            }
+        ),
         verify=lambda value: isinstance(value, dict)
         or (
             isinstance(value, str)
@@ -134,6 +209,8 @@ class Parameter(object):
     _value_source : Optional[ValueSource]
         Source of the ``Parameter`` value, should be set by
         ``ValueSource``.
+    _deprecation_descriptor : Optional[DeprecationDescriptor]
+        Indicate whether this parameter is deprecated.
     """
 
     choices: Optional[Tuple[str, ...]] = None
@@ -144,6 +221,7 @@ class Parameter(object):
     _value: Any = _UNSET
     _subs: list = []
     _once: DefaultDict[Any, list] = defaultdict(list)
+    _deprecation_descriptor: Optional[DeprecationDescriptor] = None
 
     @classmethod
     def _get_raw_from_config(cls) -> str:
@@ -254,6 +332,10 @@ class Parameter(object):
         Any
             Decoded and verified config value.
         """
+        if cls._deprecation_descriptor is not None:
+            warnings.warn(
+                cls._deprecation_descriptor.deprecation_message(), FutureWarning
+            )
         if cls._value is _UNSET:
             # get the value from env
             try:
@@ -278,6 +360,10 @@ class Parameter(object):
         value : Any
             Config value to set.
         """
+        if cls._deprecation_descriptor is not None:
+            warnings.warn(
+                cls._deprecation_descriptor.deprecation_message(), FutureWarning
+            )
         cls._check_callbacks(cls._put_nocallback(value))
         cls._value_source = ValueSource.SET_BY_USER
 
@@ -365,4 +451,49 @@ class Parameter(object):
         raise TypeError("Cannot add a choice to a parameter where choices is None")
 
 
-__all__ = ["Parameter"]
+@contextlib.contextmanager
+def context(**config: dict[str, Any]) -> Iterator[None]:
+    """
+    Set a value(s) for the specified config(s) from ``modin.config`` in the scope of the context.
+
+    Parameters
+    ----------
+    **config : dict[str, Any]
+        Keyword describing a name of a config variable from ``modin.config`` as a key
+        and a new value as a value.
+
+    Examples
+    --------
+    >>> RangePartitioning.get()
+    False
+    >>> with context(RangePartitioning=True):
+    ...     print(RangePartitioning.get()) # True
+    True
+    False
+    >>> RangePartitioning.get()
+    False
+    >>> with context(RangePartitioning=True, AsyncReadMode=True):
+    ...     print(RangePartitioning.get()) # True
+    ...     print(AsyncReadMode.get()) # True
+    True
+    True
+    >>> RangePartitioning.get()
+    False
+    >>> AsyncReadMode.get()
+    False
+    """
+    import modin.config as cfg
+
+    old_values = {}
+    for name, val in config.items():
+        var = getattr(cfg, name)
+        old_values[var] = var.get()
+        var.put(val)
+    try:
+        yield
+    finally:
+        for var, val in old_values.items():
+            var.put(val)
+
+
+__all__ = ["Parameter", "context"]

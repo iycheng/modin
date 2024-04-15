@@ -13,26 +13,24 @@
 
 """General Modin on HDK storage format benchmarks."""
 
-from ..utils import (
-    generate_dataframe,
-    gen_nan_data,
-    RAND_LOW,
-    RAND_HIGH,
-    GROUPBY_NGROUPS,
-    IMPL,
-    execute,
-    translator_groupby_ngroups,
-    random_columns,
-    random_booleans,
-    trigger_import,
-    get_benchmark_shapes,
-)
 import numpy as np
 import pandas
 
-from ..benchmarks import (
-    TimeIndexing as TimeIndexingPandasExecution,
-    TimeIndexingColumns as TimeIndexingColumnsPandasExecution,
+from ..benchmarks import TimeIndexing as TimeIndexingPandasExecution
+from ..benchmarks import TimeIndexingColumns as TimeIndexingColumnsPandasExecution
+from ..utils import (
+    GROUPBY_NGROUPS,
+    IMPL,
+    RAND_HIGH,
+    RAND_LOW,
+    execute,
+    gen_nan_data,
+    generate_dataframe,
+    get_benchmark_shapes,
+    random_booleans,
+    random_columns,
+    translator_groupby_ngroups,
+    trigger_import,
 )
 
 
@@ -123,27 +121,6 @@ class TimeMerge:
                 self.dfs[1], on="col1", how=how, suffixes=("left_", "right_")
             )
         )
-
-
-class TimeAppend:
-    param_names = ["shapes"]
-    params = [get_benchmark_shapes("hdk.TimeAppend")]
-
-    def setup(self, shapes):
-        self.df1, self.df2 = (
-            generate_dataframe(
-                "int",
-                *shape,
-                RAND_LOW,
-                RAND_HIGH,
-                cache_prefix=f"{i}-th_frame_to_append",
-            )
-            for i, shape in enumerate(shapes)
-        )
-        trigger_import(self.df1, self.df2)
-
-    def time_append(self, shapes):
-        execute(self.df1.append(self.df2))
 
 
 class TimeBinaryOpDataFrame:

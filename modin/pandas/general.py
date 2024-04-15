@@ -13,25 +13,33 @@
 
 """Implement pandas general API."""
 
-import pandas
-import numpy as np
+from __future__ import annotations
 
-from typing import Hashable, Iterable, Mapping, Union
+import warnings
+from typing import Hashable, Iterable, Mapping, Optional, Union
+
+import numpy as np
+import pandas
+from pandas._libs.lib import NoDefault, no_default
+from pandas._typing import ArrayLike, DtypeBackend, Scalar, npt
 from pandas.core.dtypes.common import is_list_like
 
+from modin.core.storage_formats import BaseQueryCompiler
 from modin.error_message import ErrorMessage
+from modin.logging import enable_logging
+from modin.pandas.io import to_pandas
+from modin.utils import _inherit_docstrings
+
 from .base import BasePandasDataset
 from .dataframe import DataFrame
 from .series import Series
-from modin.utils import to_pandas
-from modin.core.storage_formats.base.query_compiler import BaseQueryCompiler
-from modin.utils import _inherit_docstrings
-from modin.logging import enable_logging
 
 
 @_inherit_docstrings(pandas.isna, apilink="pandas.isna")
 @enable_logging
-def isna(obj):  # noqa: PR01, RT01, D200
+def isna(
+    obj,
+) -> bool | npt.NDArray[np.bool_] | Series | DataFrame:  # noqa: PR01, RT01, D200
     """
     Detect missing values for an array-like object.
     """
@@ -46,7 +54,9 @@ isnull = isna
 
 @_inherit_docstrings(pandas.notna, apilink="pandas.notna")
 @enable_logging
-def notna(obj):  # noqa: PR01, RT01, D200
+def notna(
+    obj,
+) -> bool | npt.NDArray[np.bool_] | Series | DataFrame:  # noqa: PR01, RT01, D200
     """
     Detect non-missing values for an array-like object.
     """
@@ -72,10 +82,10 @@ def merge(
     right_index: bool = False,
     sort: bool = False,
     suffixes=("_x", "_y"),
-    copy: bool = True,
+    copy: Optional[bool] = None,
     indicator: bool = False,
     validate=None,
-):  # noqa: PR01, RT01, D200
+) -> DataFrame:  # noqa: PR01, RT01, D200
     """
     Merge DataFrame or named Series objects with a database-style join.
     """
@@ -123,17 +133,15 @@ def merge_ordered(
     """
     Perform a merge for ordered data with optional filling/interpolation.
     """
-    if not isinstance(left, DataFrame):
-        raise ValueError(
-            "can not merge DataFrame with instance of type {}".format(type(right))
-        )
-    ErrorMessage.default_to_pandas("`merge_ordered`")
-    if isinstance(right, DataFrame):
-        right = to_pandas(right)
+    for operand in (left, right):
+        if not isinstance(operand, (Series, DataFrame)):
+            raise TypeError(
+                f"Can only merge Series or DataFrame objects, a {type(operand)} was passed"
+            )
+
     return DataFrame(
-        pandas.merge_ordered(
-            to_pandas(left),
-            right,
+        query_compiler=left._query_compiler.merge_ordered(
+            right._query_compiler,
             on=on,
             left_on=left_on,
             right_on=right_on,
@@ -228,9 +236,9 @@ def pivot_table(
     margins=False,
     dropna=True,
     margins_name="All",
-    observed=False,
+    observed=no_default,
     sort=True,
-):
+) -> DataFrame:
     if not isinstance(data, DataFrame):
         raise ValueError(
             "can not create pivot table with instance of type {}".format(type(data))
@@ -245,13 +253,16 @@ def pivot_table(
         margins=margins,
         dropna=dropna,
         margins_name=margins_name,
+        observed=observed,
         sort=sort,
     )
 
 
 @_inherit_docstrings(pandas.pivot, apilink="pandas.pivot")
 @enable_logging
-def pivot(data, index=None, columns=None, values=None):  # noqa: PR01, RT01, D200
+def pivot(
+    data, *, columns, index=no_default, values=no_default
+) -> DataFrame:  # noqa: PR01, RT01, D200
     """
     Return reshaped DataFrame organized by given index / column values.
     """
@@ -262,13 +273,22 @@ def pivot(data, index=None, columns=None, values=None):  # noqa: PR01, RT01, D20
 
 @_inherit_docstrings(pandas.to_numeric, apilink="pandas.to_numeric")
 @enable_logging
-def to_numeric(arg, errors="raise", downcast=None):  # noqa: PR01, RT01, D200
+def to_numeric(
+    arg,
+    errors="raise",
+    downcast=None,
+    dtype_backend: Union[DtypeBackend, NoDefault] = no_default,
+) -> Scalar | np.ndarray | Series:  # noqa: PR01, RT01, D200
     """
     Convert argument to a numeric type.
     """
     if not isinstance(arg, Series):
-        return pandas.to_numeric(arg, errors=errors, downcast=downcast)
-    return arg._to_numeric(errors=errors, downcast=downcast)
+        return pandas.to_numeric(
+            arg, errors=errors, downcast=downcast, dtype_backend=dtype_backend
+        )
+    return arg._to_numeric(
+        errors=errors, downcast=downcast, dtype_backend=dtype_backend
+    )
 
 
 @_inherit_docstrings(pandas.qcut, apilink="pandas.qcut")
@@ -290,9 +310,63 @@ def qcut(
     return x._qcut(q, **kwargs)
 
 
+@_inherit_docstrings(pandas.cut, apilink="pandas.cut")
+@enable_logging
+def cut(
+    x,
+    bins,
+    right: bool = True,
+    labels=None,
+    retbins: bool = False,
+    precision: int = 3,
+    include_lowest: bool = False,
+    duplicates: str = "raise",
+    ordered: bool = True,
+):
+    if isinstance(x, DataFrame):
+        raise ValueError("Input array must be 1 dimensional")
+    if not isinstance(x, Series):
+        ErrorMessage.default_to_pandas(
+            reason=f"pd.cut is not supported on objects of type {type(x)}"
+        )
+        import pandas
+
+        return pandas.cut(
+            x,
+            bins,
+            right=right,
+            labels=labels,
+            retbins=retbins,
+            precision=precision,
+            include_lowest=include_lowest,
+            duplicates=duplicates,
+            ordered=ordered,
+        )
+
+    def _wrap_in_series_object(qc_result):
+        if isinstance(qc_result, type(x._query_compiler)):
+            return Series(query_compiler=qc_result)
+        if isinstance(qc_result, (tuple, list)):
+            return tuple([_wrap_in_series_object(result) for result in qc_result])
+        return qc_result
+
+    return _wrap_in_series_object(
+        x._query_compiler.cut(
+            bins,
+            right=right,
+            labels=labels,
+            retbins=retbins,
+            precision=precision,
+            include_lowest=include_lowest,
+            duplicates=duplicates,
+            ordered=ordered,
+        )
+    )
+
+
 @_inherit_docstrings(pandas.unique, apilink="pandas.unique")
 @enable_logging
-def unique(values):  # noqa: PR01, RT01, D200
+def unique(values) -> ArrayLike:  # noqa: PR01, RT01, D200
     """
     Return unique values based on a hash table.
     """
@@ -303,7 +377,7 @@ def unique(values):  # noqa: PR01, RT01, D200
 @enable_logging
 def value_counts(
     values, sort=True, ascending=False, normalize=False, bins=None, dropna=True
-):
+) -> Series:
     """
     Compute a histogram of the counts of non-null values.
 
@@ -327,6 +401,11 @@ def value_counts(
     -------
     Series
     """
+    warnings.warn(
+        "pandas.value_counts is deprecated and will be removed in a "
+        + "future version. Use pd.Series(obj).value_counts() instead.",
+        FutureWarning,
+    )
     return Series(values).value_counts(
         sort=sort,
         ascending=ascending,
@@ -340,6 +419,7 @@ def value_counts(
 @enable_logging
 def concat(
     objs: "Iterable[DataFrame | Series] | Mapping[Hashable, DataFrame | Series]",
+    *,
     axis=0,
     join="outer",
     ignore_index: bool = False,
@@ -348,8 +428,8 @@ def concat(
     names=None,
     verify_integrity: bool = False,
     sort: bool = False,
-    copy: bool = True,
-) -> "DataFrame | Series":  # noqa: PR01, RT01, D200
+    copy: Optional[bool] = None,
+) -> DataFrame | Series:  # noqa: PR01, RT01, D200
     """
     Concatenate Modin objects along a particular axis.
     """
@@ -419,15 +499,12 @@ def concat(
         raise ValueError(
             "Only can inner (intersect) or outer (union) join the other axis"
         )
-    # We have the weird Series and axis check because, when concatenating a
-    # dataframe to a series on axis=0, pandas ignores the name of the series,
-    # and this check aims to mirror that (possibly buggy) functionality
     list_of_objs = [
-        obj._query_compiler
-        if isinstance(obj, DataFrame)
-        else DataFrame(obj.rename())._query_compiler
-        if isinstance(obj, (pandas.Series, Series)) and axis == 0
-        else DataFrame(obj)._query_compiler
+        (
+            obj._query_compiler
+            if isinstance(obj, DataFrame)
+            else DataFrame(obj)._query_compiler
+        )
         for obj in list_of_objs
     ]
     if keys is None and isinstance(objs, dict):
@@ -494,18 +571,18 @@ def to_datetime(
     errors="raise",
     dayfirst=False,
     yearfirst=False,
-    utc=None,
+    utc=False,
     format=None,
-    exact=True,
+    exact=no_default,
     unit=None,
-    infer_datetime_format=False,
+    infer_datetime_format=no_default,
     origin="unix",
     cache=True,
-):  # noqa: PR01, RT01, D200
+) -> Scalar | ArrayLike | Series | DataFrame:  # noqa: PR01, RT01, D200
     """
     Convert argument to datetime.
     """
-    if not isinstance(arg, (DataFrame, Series)):
+    if not hasattr(arg, "_to_datetime"):
         return pandas.to_datetime(
             arg,
             errors=errors,
@@ -544,13 +621,13 @@ def get_dummies(
     sparse=False,
     drop_first=False,
     dtype=None,
-):  # noqa: PR01, RT01, D200
+) -> DataFrame:  # noqa: PR01, RT01, D200
     """
     Convert categorical variable into dummy/indicator variables.
     """
     if sparse:
         raise NotImplementedError(
-            "SparseDataFrame is not implemented. "
+            "SparseArray is not implemented. "
             + "To contribute to Modin, please visit "
             + "github.com/modin-project/modin."
         )
@@ -592,7 +669,7 @@ def melt(
     value_name="value",
     col_level=None,
     ignore_index: bool = True,
-):  # noqa: PR01, RT01, D200
+) -> DataFrame:  # noqa: PR01, RT01, D200
     """
     Unpivot a DataFrame from wide to long format, optionally leaving identifiers set.
     """
@@ -641,7 +718,7 @@ def crosstab(
 
 # Adding docstring since pandas docs don't have web section for this function.
 @enable_logging
-def lreshape(data: DataFrame, groups, dropna=True, label=None):
+def lreshape(data: DataFrame, groups, dropna=True) -> DataFrame:
     """
     Reshape wide-format data to long. Generalized inverse of ``DataFrame.pivot``.
 
@@ -657,8 +734,6 @@ def lreshape(data: DataFrame, groups, dropna=True, label=None):
         Dictionary in the form: `{new_name : list_of_columns}`.
     dropna : bool, default: True
         Whether include columns whose entries are all NaN or not.
-    label : optional
-        Deprecated parameter.
 
     Returns
     -------
@@ -668,9 +743,7 @@ def lreshape(data: DataFrame, groups, dropna=True, label=None):
     if not isinstance(data, DataFrame):
         raise ValueError("can not lreshape with instance of type {}".format(type(data)))
     ErrorMessage.default_to_pandas("`lreshape`")
-    return DataFrame(
-        pandas.lreshape(to_pandas(data), groups, dropna=dropna, label=label)
-    )
+    return DataFrame(pandas.lreshape(to_pandas(data), groups, dropna=dropna))
 
 
 @_inherit_docstrings(pandas.wide_to_long, apilink="pandas.wide_to_long")
@@ -685,9 +758,14 @@ def wide_to_long(
         raise ValueError(
             "can not wide_to_long with instance of type {}".format(type(df))
         )
-    ErrorMessage.default_to_pandas("`wide_to_long`")
     return DataFrame(
-        pandas.wide_to_long(to_pandas(df), stubnames, i, j, sep=sep, suffix=suffix)
+        query_compiler=df._query_compiler.wide_to_long(
+            stubnames=stubnames,
+            i=i,
+            j=j,
+            sep=sep,
+            suffix=suffix,
+        )
     )
 
 
@@ -724,7 +802,9 @@ def _determine_name(objs: Iterable[BaseQueryCompiler], axis: Union[int, str]):
 
 @_inherit_docstrings(pandas.to_datetime, apilink="pandas.to_timedelta")
 @enable_logging
-def to_timedelta(arg, unit=None, errors="raise"):  # noqa: PR01, RT01, D200
+def to_timedelta(
+    arg, unit=None, errors="raise"
+) -> Scalar | pandas.Index | Series:  # noqa: PR01, RT01, D200
     """
     Convert argument to timedelta.
 

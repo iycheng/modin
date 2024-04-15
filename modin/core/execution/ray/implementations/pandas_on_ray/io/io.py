@@ -14,32 +14,51 @@
 """The module holds the factory which performs I/O using pandas on Ray."""
 
 import io
-import os
 
 import pandas
-from pandas.io.common import get_handle
+from pandas.io.common import get_handle, stringify_path
+from ray.data import from_pandas_refs
 
-from modin.core.storage_formats.pandas.query_compiler import PandasQueryCompiler
+from modin.core.execution.ray.common import RayWrapper, SignalActor
 from modin.core.execution.ray.generic.io import RayIO
 from modin.core.io import (
     CSVDispatcher,
+    ExcelDispatcher,
+    FeatherDispatcher,
     FWFDispatcher,
     JSONDispatcher,
     ParquetDispatcher,
-    FeatherDispatcher,
     SQLDispatcher,
-    ExcelDispatcher,
 )
 from modin.core.storage_formats.pandas.parsers import (
     PandasCSVParser,
+    PandasExcelParser,
+    PandasFeatherParser,
     PandasFWFParser,
     PandasJSONParser,
     PandasParquetParser,
-    PandasFeatherParser,
     PandasSQLParser,
-    PandasExcelParser,
 )
-from modin.core.execution.ray.common import RayWrapper, SignalActor
+from modin.core.storage_formats.pandas.query_compiler import PandasQueryCompiler
+from modin.distributed.dataframe.pandas.partitions import (
+    from_partitions,
+    unwrap_partitions,
+)
+from modin.experimental.core.io import (
+    ExperimentalCSVGlobDispatcher,
+    ExperimentalCustomTextDispatcher,
+    ExperimentalGlobDispatcher,
+    ExperimentalSQLDispatcher,
+)
+from modin.experimental.core.storage_formats.pandas.parsers import (
+    ExperimentalCustomTextParser,
+    ExperimentalPandasCSVGlobParser,
+    ExperimentalPandasJsonParser,
+    ExperimentalPandasParquetParser,
+    ExperimentalPandasPickleParser,
+    ExperimentalPandasXmlParser,
+)
+
 from ..dataframe import PandasOnRayDataframe
 from ..partitioning import PandasOnRayDataframePartition
 
@@ -53,67 +72,68 @@ class PandasOnRayIO(RayIO):
         frame_partition_cls=PandasOnRayDataframePartition,
         query_compiler_cls=PandasQueryCompiler,
         frame_cls=PandasOnRayDataframe,
+        base_io=RayIO,
     )
-    read_csv = type("", (RayWrapper, PandasCSVParser, CSVDispatcher), build_args).read
-    read_fwf = type("", (RayWrapper, PandasFWFParser, FWFDispatcher), build_args).read
-    read_json = type(
-        "", (RayWrapper, PandasJSONParser, JSONDispatcher), build_args
-    ).read
-    read_parquet = type(
-        "", (RayWrapper, PandasParquetParser, ParquetDispatcher), build_args
-    ).read
+
+    def __make_read(*classes, build_args=build_args):
+        # used to reduce code duplication
+        return type("", (RayWrapper, *classes), build_args).read
+
+    def __make_write(*classes, build_args=build_args):
+        # used to reduce code duplication
+        return type("", (RayWrapper, *classes), build_args).write
+
+    read_csv = __make_read(PandasCSVParser, CSVDispatcher)
+    read_fwf = __make_read(PandasFWFParser, FWFDispatcher)
+    read_json = __make_read(PandasJSONParser, JSONDispatcher)
+    read_parquet = __make_read(PandasParquetParser, ParquetDispatcher)
+    to_parquet = __make_write(ParquetDispatcher)
     # Blocked on pandas-dev/pandas#12236. It is faster to default to pandas.
-    # read_hdf = type("", (RayWrapper, PandasHDFParser, HDFReader), build_args).read
-    read_feather = type(
-        "", (RayWrapper, PandasFeatherParser, FeatherDispatcher), build_args
-    ).read
-    read_sql = type("", (RayWrapper, PandasSQLParser, SQLDispatcher), build_args).read
-    read_excel = type(
-        "", (RayWrapper, PandasExcelParser, ExcelDispatcher), build_args
-    ).read
+    # read_hdf = __make_read(PandasHDFParser, HDFReader)
+    read_feather = __make_read(PandasFeatherParser, FeatherDispatcher)
+    read_sql = __make_read(PandasSQLParser, SQLDispatcher)
+    to_sql = __make_write(SQLDispatcher)
+    read_excel = __make_read(PandasExcelParser, ExcelDispatcher)
 
-    @classmethod
-    def to_sql(cls, qc, **kwargs):
-        """
-        Write records stored in the `qc` to a SQL database.
+    # experimental methods that don't exist in pandas
+    read_csv_glob = __make_read(
+        ExperimentalPandasCSVGlobParser, ExperimentalCSVGlobDispatcher
+    )
+    read_parquet_glob = __make_read(
+        ExperimentalPandasParquetParser, ExperimentalGlobDispatcher
+    )
+    to_parquet_glob = __make_write(
+        ExperimentalGlobDispatcher,
+        build_args={**build_args, "base_write": RayIO.to_parquet},
+    )
+    read_json_glob = __make_read(
+        ExperimentalPandasJsonParser, ExperimentalGlobDispatcher
+    )
+    to_json_glob = __make_write(
+        ExperimentalGlobDispatcher,
+        build_args={**build_args, "base_write": RayIO.to_json},
+    )
+    read_xml_glob = __make_read(ExperimentalPandasXmlParser, ExperimentalGlobDispatcher)
+    to_xml_glob = __make_write(
+        ExperimentalGlobDispatcher,
+        build_args={**build_args, "base_write": RayIO.to_xml},
+    )
+    read_pickle_glob = __make_read(
+        ExperimentalPandasPickleParser, ExperimentalGlobDispatcher
+    )
+    to_pickle_glob = __make_write(
+        ExperimentalGlobDispatcher,
+        build_args={**build_args, "base_write": RayIO.to_pickle},
+    )
+    read_custom_text = __make_read(
+        ExperimentalCustomTextParser, ExperimentalCustomTextDispatcher
+    )
+    read_sql_distributed = __make_read(
+        ExperimentalSQLDispatcher, build_args={**build_args, "base_read": read_sql}
+    )
 
-        Parameters
-        ----------
-        qc : BaseQueryCompiler
-            The query compiler of the Modin dataframe that we want to run ``to_sql`` on.
-        **kwargs : dict
-            Parameters for ``pandas.to_sql(**kwargs)``.
-        """
-        # we first insert an empty DF in order to create the full table in the database
-        # This also helps to validate the input against pandas
-        # we would like to_sql() to complete only when all rows have been inserted into the database
-        # since the mapping operation is non-blocking, each partition will return an empty DF
-        # so at the end, the blocking operation will be this empty DF to_pandas
-
-        empty_df = qc.getitem_row_array([0]).to_pandas().head(0)
-        empty_df.to_sql(**kwargs)
-        # so each partition will append its respective DF
-        kwargs["if_exists"] = "append"
-        columns = qc.columns
-
-        def func(df):
-            """
-            Override column names in the wrapped dataframe and convert it to SQL.
-
-            Notes
-            -----
-            This function returns an empty ``pandas.DataFrame`` because ``apply_full_axis``
-            expects a Frame object as a result of operation (and ``to_sql`` has no dataframe result).
-            """
-            df.columns = columns
-            df.to_sql(**kwargs)
-            return pandas.DataFrame()
-
-        # Ensure that the metadata is syncrhonized
-        qc._modin_frame._propagate_index_objs(axis=None)
-        result = qc._modin_frame.apply_full_axis(1, func, new_index=[], new_columns=[])
-        # FIXME: we should be waiting for completion less expensievely, maybe use _modin_frame.materialize()?
-        result.to_pandas()  # blocking operation
+    del __make_read  # to not pollute class namespace
+    del __make_write  # to not pollute class namespace
 
     @staticmethod
     def _to_csv_check_support(kwargs):
@@ -164,12 +184,13 @@ class PandasOnRayIO(RayIO):
         **kwargs : dict
             Parameters for ``pandas.to_csv(**kwargs)``.
         """
+        kwargs["path_or_buf"] = stringify_path(kwargs["path_or_buf"])
         if not cls._to_csv_check_support(kwargs):
             return RayIO.to_csv(qc, **kwargs)
 
         signals = SignalActor.remote(len(qc._modin_frame._partitions) + 1)
 
-        def func(df, **kw):
+        def func(df, **kw):  # pragma: no cover
             """
             Dump a chunk of rows as csv, then save them to target maintaining order.
 
@@ -197,7 +218,9 @@ class PandasOnRayIO(RayIO):
             path_or_buf = csv_kwargs["path_or_buf"]
             is_binary = "b" in csv_kwargs["mode"]
             csv_kwargs["path_or_buf"] = io.BytesIO() if is_binary else io.StringIO()
+            storage_options = csv_kwargs.pop("storage_options", None)
             df.to_csv(**csv_kwargs)
+            csv_kwargs.update({"storage_options": storage_options})
             content = csv_kwargs["path_or_buf"].getvalue()
             csv_kwargs["path_or_buf"].close()
 
@@ -238,82 +261,41 @@ class PandasOnRayIO(RayIO):
         )
         # pending completion
         RayWrapper.materialize(
-            [partition.list_of_blocks[0] for partition in result.flatten()]
+            [part.list_of_blocks[0] for row in result for part in row]
         )
 
-    @staticmethod
-    def _to_parquet_check_support(kwargs):
+    @classmethod
+    def from_ray(cls, ray_obj):
         """
-        Check if parallel version of `to_parquet` could be used.
+        Create a Modin `query_compiler` from a Ray Dataset.
 
         Parameters
         ----------
-        kwargs : dict
-            Keyword arguments passed to `.to_parquet()`.
+        ray_obj : ray.data.Dataset
+            The Ray Dataset to convert from.
 
         Returns
         -------
-        bool
-            Whether parallel version of `to_parquet` is applicable.
+        BaseQueryCompiler
+            QueryCompiler containing data from the Ray Dataset.
         """
-        path = kwargs["path"]
-        compression = kwargs["compression"]
-        if not isinstance(path, str):
-            return False
-        if any((path.endswith(ext) for ext in [".gz", ".bz2", ".zip", ".xz"])):
-            return False
-        if compression is None or not compression == "snappy":
-            return False
-        return True
+        pd_objs = ray_obj.to_pandas_refs()
+        return from_partitions(pd_objs, axis=0)._query_compiler
 
     @classmethod
-    def to_parquet(cls, qc, **kwargs):
+    def to_ray(cls, modin_obj):
         """
-        Write a ``DataFrame`` to the binary parquet format.
+        Convert a Modin DataFrame/Series to a Ray Dataset.
 
         Parameters
         ----------
-        qc : BaseQueryCompiler
-            The query compiler of the Modin dataframe that we want to run `to_parquet` on.
-        **kwargs : dict
-            Parameters for `pandas.to_parquet(**kwargs)`.
+        modin_obj : modin.pandas.DataFrame, modin.pandas.Series
+            The Modin DataFrame/Series to convert.
+
+        Returns
+        -------
+        ray.data.Dataset
+            Converted object with type depending on input.
         """
-        if not cls._to_parquet_check_support(kwargs):
-            return RayIO.to_parquet(qc, **kwargs)
-
-        output_path = kwargs["path"]
-        os.makedirs(output_path, exist_ok=True)
-
-        def func(df, **kw):
-            """
-            Dump a chunk of rows as parquet, then save them to target maintaining order.
-
-            Parameters
-            ----------
-            df : pandas.DataFrame
-                A chunk of rows to write to a parquet file.
-            **kw : dict
-                Arguments to pass to ``pandas.to_parquet(**kwargs)`` plus an extra argument
-                `partition_idx` serving as chunk index to maintain rows order.
-            """
-            compression = kwargs["compression"]
-            partition_idx = kw["partition_idx"]
-            kwargs[
-                "path"
-            ] = f"{output_path}/part-{partition_idx:04d}.{compression}.parquet"
-            df.to_parquet(**kwargs)
-            return pandas.DataFrame()
-
-        # Ensure that the metadata is synchronized
-        qc._modin_frame._propagate_index_objs(axis=None)
-        result = qc._modin_frame._partition_mgr_cls.map_axis_partitions(
-            axis=1,
-            partitions=qc._modin_frame._partitions,
-            map_func=func,
-            keep_partitioning=True,
-            lengths=None,
-            enumerate_partitions=True,
-        )
-        RayWrapper.materialize(
-            [part.list_of_blocks[0] for row in result for part in row]
-        )
+        parts = unwrap_partitions(modin_obj, axis=0)
+        return from_pandas_refs(parts)

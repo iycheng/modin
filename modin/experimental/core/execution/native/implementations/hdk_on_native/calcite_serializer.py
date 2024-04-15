@@ -13,28 +13,27 @@
 
 """Module provides ``CalciteSerializer`` class."""
 
-from .expr import (
-    BaseExpr,
-    LiteralExpr,
-    OpExpr,
-    AggregateExpr,
-)
+import json
+
+import numpy as np
+from pandas.core.dtypes.common import is_datetime64_dtype
+
+from modin.error_message import ErrorMessage
+
 from .calcite_algebra import (
-    CalciteBaseNode,
-    CalciteInputRefExpr,
-    CalciteInputIdxExpr,
-    CalciteScanNode,
-    CalciteProjectionNode,
-    CalciteFilterNode,
     CalciteAggregateNode,
+    CalciteBaseNode,
     CalciteCollation,
-    CalciteSortNode,
+    CalciteFilterNode,
+    CalciteInputIdxExpr,
+    CalciteInputRefExpr,
     CalciteJoinNode,
+    CalciteProjectionNode,
+    CalciteScanNode,
+    CalciteSortNode,
     CalciteUnionNode,
 )
-from modin.error_message import ErrorMessage
-import json
-import numpy as np
+from .expr import AggregateExpr, BaseExpr, LiteralExpr, OpExpr
 
 
 def _warn_if_unsigned(dtype):  # noqa: GL08
@@ -65,6 +64,7 @@ class CalciteSerializer:
         "bool": "BOOLEAN",
         "float32": "FLOAT",
         "float64": "DOUBLE",
+        "datetime64": "TIMESTAMP",
     }
 
     _INT_OPTS = {
@@ -78,6 +78,16 @@ class CalciteSerializer:
         np.uint64: ("BIGINT", 19),
         int: ("BIGINT", 19),
     }
+
+    _TIMESTAMP_PRECISION = {
+        "s": 0,
+        "ms": 3,
+        "us": 6,
+        "ns": 9,
+    }
+    _DTYPE_STRINGS.update(
+        {f"datetime64[{u}]": "TIMESTAMP" for u in _TIMESTAMP_PRECISION}
+    )
 
     def serialize(self, plan):
         """
@@ -122,7 +132,7 @@ class CalciteSerializer:
 
         Returns
         -------
-        str, int, dict or list of dict
+        str, int, None, dict or list of dict
             Serialized item.
         """
         if isinstance(item, CalciteBaseNode):
@@ -133,8 +143,10 @@ class CalciteSerializer:
             return self.serialize_obj(item)
         elif isinstance(item, list):
             return [self.serialize_item(v) for v in item]
+        elif isinstance(item, dict):
+            return {k: self.serialize_item(v) for k, v in item.items()}
 
-        self.expect_one_of(item, str, int)
+        self.expect_one_of(item, str, int, type(None))
         return item
 
     def serialize_node(self, node):
@@ -189,7 +201,10 @@ class CalciteSerializer:
         res = {}
         for k, v in obj.__dict__.items():
             if k[0] != "_":
-                res[k] = self.serialize_item(v)
+                if k == "op" and isinstance(obj, OpExpr) and v == "//":
+                    res[k] = "/"
+                else:
+                    res[k] = self.serialize_item(v)
         return res
 
     def serialize_typed_obj(self, obj):
@@ -256,7 +271,8 @@ class CalciteSerializer:
         dict
             Serialized literal.
         """
-        if literal.val is None:
+        val = literal.val
+        if val is None:
             return {
                 "literal": None,
                 "type": "BIGINT",
@@ -266,29 +282,40 @@ class CalciteSerializer:
                 "type_scale": 0,
                 "type_precision": 19,
             }
-        if type(literal.val) is str:
+        if type(val) is str:
             return {
-                "literal": literal.val,
+                "literal": val,
                 "type": "CHAR",
                 "target_type": "CHAR",
                 "scale": -2147483648,
-                "precision": len(literal.val),
+                "precision": len(val),
                 "type_scale": -2147483648,
-                "type_precision": len(literal.val),
+                "type_precision": len(val),
             }
-        if type(literal.val) in self._INT_OPTS.keys():
-            target_type, precision = self.opts_for_int_type(type(literal.val))
+        if type(val) in self._INT_OPTS.keys():
+            target_type, precision = self.opts_for_int_type(type(val))
             return {
-                "literal": int(literal.val),
+                "literal": int(val),
                 "type": "DECIMAL",
                 "target_type": target_type,
                 "scale": 0,
-                "precision": len(str(literal.val)),
+                "precision": len(str(val)),
                 "type_scale": 0,
                 "type_precision": precision,
             }
-        if type(literal.val) in (float, np.float64):
-            str_val = f"{literal.val:f}"
+        if type(val) in (float, np.float64):
+            if np.isnan(val):
+                return {
+                    "literal": None,
+                    "type": "DOUBLE",
+                    "target_type": "DOUBLE",
+                    "scale": 0,
+                    "precision": 19,
+                    "type_scale": 0,
+                    "type_precision": 19,
+                }
+
+            str_val = f"{val:f}"
             precision = len(str_val) - 1
             scale = precision - str_val.index(".")
             return {
@@ -300,9 +327,9 @@ class CalciteSerializer:
                 "type_scale": -2147483648,
                 "type_precision": 15,
             }
-        if type(literal.val) is bool:
+        if type(val) is bool:
             return {
-                "literal": literal.val,
+                "literal": val,
                 "type": "BOOLEAN",
                 "target_type": "BOOLEAN",
                 "scale": -2147483648,
@@ -310,7 +337,21 @@ class CalciteSerializer:
                 "type_scale": -2147483648,
                 "type_precision": 1,
             }
-        raise NotImplementedError(f"Can not serialize {type(literal.val).__name__}")
+        if isinstance(val, np.datetime64):
+            unit = np.datetime_data(val)[0]
+            precision = self._TIMESTAMP_PRECISION.get(unit, None)
+            if precision is not None:
+                return {
+                    "literal": int(val.astype(np.int64)),
+                    "type": "TIMESTAMP",
+                    "target_type": "TIMESTAMP",
+                    "scale": -2147483648,
+                    "precision": precision,
+                    "type_scale": -2147483648,
+                    "type_precision": precision,
+                }
+
+        raise NotImplementedError(f"Can not serialize {type(val).__name__}")
 
     def opts_for_int_type(self, int_type):
         """
@@ -350,7 +391,11 @@ class CalciteSerializer:
         """
         _warn_if_unsigned(dtype)
         try:
-            return {"type": self._DTYPE_STRINGS[dtype.name], "nullable": True}
+            type_info = {"type": self._DTYPE_STRINGS[dtype.name], "nullable": True}
+            if is_datetime64_dtype(dtype):
+                unit = np.datetime_data(dtype)[0]
+                type_info["precision"] = self._TIMESTAMP_PRECISION[unit]
+            return type_info
         except KeyError:
             raise TypeError(f"Unsupported dtype: {dtype}")
 

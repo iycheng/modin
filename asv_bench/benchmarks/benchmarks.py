@@ -19,23 +19,23 @@
 # define `MODIN_ASV_USE_IMPL` env var to choose library for using in performance
 # measurements
 
-import numpy as np
-import pandas._testing as tm
 import math
 
+import numpy as np
+
 from .utils import (
-    generate_dataframe,
-    gen_nan_data,
-    RAND_LOW,
-    RAND_HIGH,
-    random_string,
-    random_columns,
-    random_booleans,
     GROUPBY_NGROUPS,
     IMPL,
+    RAND_HIGH,
+    RAND_LOW,
     execute,
-    translator_groupby_ngroups,
+    gen_nan_data,
+    generate_dataframe,
     get_benchmark_shapes,
+    random_booleans,
+    random_columns,
+    random_string,
+    translator_groupby_ngroups,
     trigger_import,
 )
 
@@ -138,8 +138,10 @@ class TimeJoinStringIndex:
 
     def setup(self, shapes, sort):
         assert shapes[0] % 100 == 0, "implementation restriction"
-        level1 = tm.makeStringIndex(10).values
-        level2 = tm.makeStringIndex(shapes[0] // 100).values
+        level1 = IMPL.Index([f"i-{i}" for i in range(10)], dtype=object).values
+        level2 = IMPL.Index(
+            [f"i-{i}" for i in range(shapes[0] // 100)], dtype=object
+        ).values
         codes1 = np.arange(10).repeat(shapes[0] // 100)
         codes2 = np.tile(np.arange(shapes[0] // 100), 10)
         index2 = IMPL.MultiIndex(levels=[level1, level2], codes=[codes1, codes2])
@@ -274,23 +276,6 @@ class TimeConcat:
                 [self.df1, self.df2], axis=axis, join=how, ignore_index=ignore_index
             )
         )
-
-
-class TimeAppend:
-    param_names = ["shapes", "sort"]
-    params = [
-        get_benchmark_shapes("TimeAppend"),
-        [False, True],
-    ]
-
-    def setup(self, shapes, sort):
-        self.df1 = generate_dataframe("int", *shapes[0], RAND_LOW, RAND_HIGH)
-        self.df2 = generate_dataframe("int", *shapes[1], RAND_LOW, RAND_HIGH)
-        if sort:
-            self.df1.columns = self.df1.columns[::-1]
-
-    def time_append(self, shapes, sort):
-        execute(self.df1.append(self.df2, sort=sort))
 
 
 class TimeBinaryOp:
@@ -488,7 +473,7 @@ class TimeDrop:
         self.labels = self.df.axes[axis][:drop_count]
 
     def time_drop(self, shape, axis, drop_ncols):
-        execute(self.df.drop(self.labels, axis))
+        execute(self.df.drop(self.labels, axis=axis))
 
 
 class TimeHead:
@@ -913,8 +898,12 @@ class TimeReindex:
         self.df2 = IMPL.DataFrame(
             index=range(rows), data=np.random.rand(rows, cols), columns=range(cols)
         )
-        level1 = tm.makeStringIndex(rows // 10).values.repeat(10)
-        level2 = np.tile(tm.makeStringIndex(10).values, rows // 10)
+        level1 = IMPL.Index(
+            [f"i-{i}" for i in range(rows // 10)], dtype=object
+        ).values.repeat(10)
+        level2 = np.tile(
+            IMPL.Index([f"i-{i}" for i in range(10)], dtype=object).values, rows // 10
+        )
         index = IMPL.MultiIndex.from_arrays([level1, level2])
         self.s = IMPL.Series(np.random.randn(rows), index=index)
         self.s_subset = self.s[::2]
@@ -1049,7 +1038,9 @@ class TimeDropDuplicatesDataframe:
         temp_df = DataFrame()
         # dataframe would  have cols-1 keys(strings) and one value(int) column
         for col in range(cols - 1):
-            temp_df["key" + str(col + 1)] = tm.makeStringIndex(N).values.repeat(K)
+            temp_df["key" + str(col + 1)] = IMPL.Index(
+                [f"i-{i}" for i in range(N)], dtype=object
+            ).values.repeat(K)
         self.df = IMPL.DataFrame(temp_df)
         self.df["value"] = np.random.randn(N * K)
         execute(self.df)
@@ -1068,7 +1059,12 @@ class TimeDropDuplicatesSeries:
 
     def setup(self, shape):
         rows = shape[0]
-        self.series = IMPL.Series(np.tile(tm.makeStringIndex(rows // 10).values, 10))
+        self.series = IMPL.Series(
+            np.tile(
+                IMPL.Index([f"i-{i}" for i in range(rows // 10)], dtype=object).values,
+                10,
+            )
+        )
         execute(self.series)
 
     def time_drop_dups(self, shape):

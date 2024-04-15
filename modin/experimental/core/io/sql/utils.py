@@ -13,10 +13,9 @@
 
 """Utilities for experimental SQL format type IO functions implementations."""
 
-from collections import OrderedDict
-
-from sqlalchemy import MetaData, Table, create_engine, inspect
 import pandas
+import pandas._libs.lib as lib
+from sqlalchemy import MetaData, Table, create_engine, inspect, text
 
 from modin.core.storage_formats.pandas.parsers import _split_result_for_readers
 
@@ -108,10 +107,10 @@ def get_table_columns(metadata):
 
     Returns
     -------
-    OrderedDict
+    dict
         Dictionary with columns names and python types.
     """
-    cols = OrderedDict()
+    cols = dict()
     for col in metadata.c:
         name = str(col).rpartition(".")[2]
         cols[name] = col.type.python_type.__name__
@@ -164,14 +163,14 @@ def get_query_columns(engine, query):
 
     Returns
     -------
-    OrderedDict
+    dict
         Dictionary with columns names and python types.
     """
     con = engine.connect()
-    result = con.execute(query).fetchone()
-    values = list(result)
+    result = con.execute(text(query))
     cols_names = list(result.keys())
-    cols = OrderedDict()
+    values = list(result.first())
+    cols = dict()
     for i in range(len(cols_names)):
         cols[cols_names[i]] = type(values[i]).__name__
     return cols
@@ -185,7 +184,7 @@ def check_partition_column(partition_column, cols):
     ----------
     partition_column : str
         Column name used for data partitioning between the workers.
-    cols : OrderedDict/dict
+    cols : dict
         Dictionary with columns names and python types.
     """
     for k, v in cols.items():
@@ -233,7 +232,7 @@ def get_query_info(sql, con, partition_column):
     return list(cols.keys()), query
 
 
-def query_put_bounders(query, partition_column, start, end):
+def query_put_bounders(query, partition_column, start, end):  # pragma: no cover
     """
     Put partition boundaries into the query.
 
@@ -285,7 +284,9 @@ def read_sql_with_offset(
     parse_dates=None,
     columns=None,
     chunksize=None,
-):
+    dtype_backend=lib.no_default,
+    dtype=None,
+):  # pragma: no cover
     """
     Read a chunk of SQL query or table into a pandas DataFrame.
 
@@ -330,6 +331,13 @@ def read_sql_with_offset(
     chunksize : int, optional
         If specified, return an iterator where `chunksize` is the number of rows
         to include in each chunk.
+    dtype_backend : {"numpy_nullable", "pyarrow"}, default: NumPy backed DataFrames
+        Which dtype_backend to use, e.g. whether a DataFrame should have NumPy arrays,
+        nullable dtypes are used for all dtypes that have a nullable implementation when
+        "numpy_nullable" is set, PyArrow is used for all dtypes if "pyarrow" is set.
+        The dtype_backends are still experimential.
+    dtype : Type name or dict of columns, optional
+        Data type for data or columns. E.g. np.float64 or {'a': np.float64, 'b': np.int32, 'c': 'Int64'}. The argument is ignored if a table is passed instead of a query.
 
     Returns
     -------
@@ -346,6 +354,8 @@ def read_sql_with_offset(
         parse_dates=parse_dates,
         columns=columns,
         chunksize=chunksize,
+        dtype_backend=dtype_backend,
+        dtype=dtype,
     )
     index = len(pandas_df)
     return _split_result_for_readers(1, num_splits, pandas_df) + [index]

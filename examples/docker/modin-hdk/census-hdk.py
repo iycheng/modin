@@ -12,19 +12,11 @@
 # governing permissions and limitations under the License.
 
 import sys
-from utils import measure
-import modin.pandas as pd
-from modin.experimental.core.execution.native.implementations.hdk_on_native.db_worker import (
-    DbWorker,
-)
 
-from sklearn import config_context
-import sklearnex
-
-sklearnex.patch_sklearn()
-from sklearn.model_selection import train_test_split
-import sklearn.linear_model as lm
 import numpy as np
+from utils import measure
+
+import modin.pandas as pd
 
 
 def read(filename):
@@ -131,12 +123,8 @@ def read(filename):
         skiprows=1,
     )
 
-    df.shape  # to trigger real execution
-    df._query_compiler._modin_frame._partitions[0][
-        0
-    ].frame_id = DbWorker().import_arrow_table(
-        df._query_compiler._modin_frame._partitions[0][0].get()
-    )  # to trigger real execution
+    # to trigger real execution and table import
+    df._query_compiler._modin_frame.force_import()
     return df
 
 
@@ -203,6 +191,14 @@ def cod(y_test, y_pred):
 
 
 def ml(X, y, random_state, n_runs, test_size):
+    # to not install ML dependencies unless required
+    import sklearnex
+    from sklearn import config_context
+
+    sklearnex.patch_sklearn()
+    import sklearn.linear_model as lm
+    from sklearn.model_selection import train_test_split
+
     clf = lm.Ridge()
 
     X = np.ascontiguousarray(X, dtype=np.float64)

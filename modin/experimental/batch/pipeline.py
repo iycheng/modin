@@ -14,15 +14,16 @@
 """Module houses ``PandasQueryPipeline`` and ``PandasQuery`` classes, that implement a batch pipeline protocol for Modin Dataframes."""
 
 from typing import Callable, Optional
+
 import numpy as np
 
 import modin.pandas as pd
-from modin.core.storage_formats.pandas import PandasQueryCompiler
-from modin.error_message import ErrorMessage
+from modin.config import NPartitions
 from modin.core.execution.ray.implementations.pandas_on_ray.dataframe.dataframe import (
     PandasOnRayDataframe,
 )
-from modin.config import NPartitions
+from modin.core.storage_formats.pandas import PandasQueryCompiler
+from modin.error_message import ErrorMessage
 from modin.utils import get_current_execution
 
 
@@ -258,7 +259,7 @@ class PandasQueryPipeline(object):
                 )
                 new_dfs = []
 
-                def mask_partition(df, i):
+                def mask_partition(df, i):  # pragma: no cover
                     new_length = len(df.index) // self.num_partitions
                     if i == self.num_partitions - 1:
                         return df.iloc[i * new_length :]

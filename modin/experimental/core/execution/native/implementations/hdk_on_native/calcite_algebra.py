@@ -19,6 +19,9 @@ HDK storage format.
 """
 
 import abc
+
+from .dataframe.utils import ColNameCodec
+from .db_worker import DbTable
 from .expr import BaseExpr
 
 
@@ -143,14 +146,19 @@ class CalciteBaseNode(abc.ABC):
         self.relOp = relOp
 
     @classmethod
-    def reset_id(cls):
+    def reset_id(cls, next_id=0):
         """
-        Reset ID to be used for the next new node to 0.
+        Reset ID to be used for the next new node to `next_id`.
 
         Can be used to have a zero-based numbering for each
         generated query.
+
+        Parameters
+        ----------
+        next_id : int, default: 0
+            Next node id.
         """
-        cls._next_id[0] = 0
+        cls._next_id[0] = next_id
 
 
 class CalciteScanNode(CalciteBaseNode):
@@ -178,11 +186,14 @@ class CalciteScanNode(CalciteBaseNode):
     """
 
     def __init__(self, modin_frame):
-        assert modin_frame._partitions.size == 1
-        assert modin_frame._partitions[0][0].frame_id is not None
+        assert modin_frame._partitions is not None
+        table = modin_frame._partitions[0][0].get()
+        assert isinstance(table, DbTable)
         super(CalciteScanNode, self).__init__("EnumerableTableScan")
-        self.table = ["hdk", modin_frame._partitions[0][0].frame_id]
-        self.fieldNames = [f"F_{col}" for col in modin_frame._table_cols] + ["rowid"]
+        self.table = ["hdk", table.name]
+        self.fieldNames = [
+            ColNameCodec.encode(col) for col in modin_frame._table_cols
+        ] + ["rowid"]
         # HDK expects from scan node to have 'inputs' field
         # holding empty list
         self.inputs = []
@@ -210,7 +221,7 @@ class CalciteProjectionNode(CalciteBaseNode):
 
     def __init__(self, fields, exprs):
         super(CalciteProjectionNode, self).__init__("LogicalProject")
-        self.fields = [f"F_{field}" for field in fields]
+        self.fields = [ColNameCodec.encode(field) for field in fields]
         self.exprs = exprs
 
 
@@ -259,7 +270,7 @@ class CalciteAggregateNode(CalciteBaseNode):
 
     def __init__(self, fields, group, aggs):
         super(CalciteAggregateNode, self).__init__("LogicalAggregate")
-        self.fields = [f"F_{field}" for field in fields]
+        self.fields = [ColNameCodec.encode(field) for field in fields]
         self.group = group
         self.aggs = aggs
 

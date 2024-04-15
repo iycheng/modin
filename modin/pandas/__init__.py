@@ -11,22 +11,32 @@
 # ANY KIND, either express or implied. See the License for the specific language
 # governing permissions and limitations under the License.
 
-import pandas
 import warnings
 
-__pandas_version__ = "1.5.3"
+import pandas
+from packaging import version
 
-if pandas.__version__ != __pandas_version__:
+__pandas_version__ = "2.2"
+
+if (
+    version.parse(pandas.__version__).release[:2]
+    != version.parse(__pandas_version__).release[:2]
+):
     warnings.warn(
         f"The pandas version installed ({pandas.__version__}) does not match the supported pandas version in"
-        + f" Modin ({__pandas_version__}). This may cause undesired side effects!"
+        + f" Modin ({__pandas_version__}.X). This may cause undesired side effects!"
     )
+
+# The extensions assigned to this module
+_PD_EXTENSIONS_ = {}
+
+# to not pollute namespace
+del version
 
 with warnings.catch_warnings():
     warnings.simplefilter("ignore")
     from pandas import (
         eval,
-        cut,
         factorize,
         test,
         date_range,
@@ -65,9 +75,6 @@ with warnings.catch_warnings():
         IntervalDtype,
         PeriodDtype,
         RangeIndex,
-        Int64Index,
-        UInt64Index,
-        Float64Index,
         TimedeltaIndex,
         IntervalIndex,
         IndexSlice,
@@ -79,7 +86,6 @@ with warnings.catch_warnings():
         infer_freq,
         interval_range,
         ExcelWriter,
-        datetime,
         NamedAgg,
         NA,
         api,
@@ -88,7 +94,9 @@ with warnings.catch_warnings():
         Float32Dtype,
         Float64Dtype,
         from_dummies,
+        testing,
     )
+
 import os
 
 from modin.config import Parameter
@@ -97,9 +105,13 @@ _is_first_update = {}
 
 
 def _update_engine(publisher: Parameter):
-    from modin.config import Engine, StorageFormat, CpuCount
-    from modin.config.envvars import IsExperimental
-    from modin.config.pubsub import ValueSource
+    from modin.config import (
+        CpuCount,
+        Engine,
+        IsExperimental,
+        StorageFormat,
+        ValueSource,
+    )
 
     # Set this so that Pandas doesn't try to multithread by itself
     os.environ["OMP_NUM_THREADS"] = "1"
@@ -153,106 +165,94 @@ def _update_engine(publisher: Parameter):
             from modin.core.execution.unidist.common import initialize_unidist
 
             initialize_unidist()
-    elif publisher.get() == "Cloudray":
-        from modin.experimental.cloud import get_connection
-
-        conn = get_connection()
-        if _is_first_update.get("Cloudray", True):
-
-            @conn.teleport
-            def init_remote_ray(partition):
-                from ray import ray_constants
-                import modin
-                from modin.core.execution.ray.common import initialize_ray
-
-                modin.set_execution("Ray", partition)
-                initialize_ray(
-                    override_is_cluster=True,
-                    override_redis_address=f"localhost:{ray_constants.DEFAULT_PORT}",
-                    override_redis_password=ray_constants.REDIS_DEFAULT_PASSWORD,
-                )
-
-            init_remote_ray(StorageFormat.get())
-            # import FactoryDispatcher here to initialize IO class
-            # so it doesn't skew read_csv() timings later on
-            import modin.core.execution.dispatching.factories.dispatcher  # noqa: F401
-        else:
-            get_connection().modules["modin"].set_execution("Ray", StorageFormat.get())
-    elif publisher.get() == "Cloudpython":
-        from modin.experimental.cloud import get_connection
-
-        get_connection().modules["modin"].set_execution("Python")
-    elif publisher.get() == "Cloudnative":
-        from modin.experimental.cloud import get_connection
-
-        assert (
-            is_hdk
-        ), f"Storage format should be 'Hdk' with 'Cloudnative' engine, but provided {sfmt}."
-        get_connection().modules["modin"].set_execution("Native", "Hdk")
-
     elif publisher.get() not in Engine.NOINIT_ENGINES:
         raise ImportError("Unrecognized execution engine: {}.".format(publisher.get()))
 
     _is_first_update[publisher.get()] = False
 
 
+from modin.pandas import arrays, errors
+from modin.utils import show_versions
+
 from .. import __version__
 from .dataframe import DataFrame
-from .io import (
-    read_csv,
-    read_parquet,
-    read_json,
-    read_html,
-    read_clipboard,
-    read_excel,
-    read_hdf,
-    read_feather,
-    read_stata,
-    read_sas,
-    read_pickle,
-    read_sql,
-    read_gbq,
-    read_table,
-    read_fwf,
-    read_sql_table,
-    read_sql_query,
-    read_spss,
-    ExcelFile,
-    to_pickle,
-    HDFStore,
-    json_normalize,
-    read_orc,
-    read_xml,
-)
-from .series import Series
 from .general import (
     concat,
+    crosstab,
+    cut,
+    get_dummies,
     isna,
     isnull,
+    lreshape,
+    melt,
     merge,
     merge_asof,
     merge_ordered,
-    notnull,
     notna,
+    notnull,
     pivot,
-    to_numeric,
+    pivot_table,
     qcut,
     to_datetime,
+    to_numeric,
+    to_timedelta,
     unique,
     value_counts,
-    get_dummies,
-    melt,
-    crosstab,
-    lreshape,
     wide_to_long,
-    to_timedelta,
-    pivot_table,
 )
-
+from .io import (
+    ExcelFile,
+    HDFStore,
+    json_normalize,
+    read_clipboard,
+    read_csv,
+    read_excel,
+    read_feather,
+    read_fwf,
+    read_gbq,
+    read_hdf,
+    read_html,
+    read_json,
+    read_orc,
+    read_parquet,
+    read_pickle,
+    read_sas,
+    read_spss,
+    read_sql,
+    read_sql_query,
+    read_sql_table,
+    read_stata,
+    read_table,
+    read_xml,
+    to_pickle,
+)
 from .plotting import Plotting as plotting
-from modin.utils import show_versions
+from .series import Series
+
+
+def __getattr__(name: str):
+    """
+    Overrides getattr on the module to enable extensions.
+
+    Parameters
+    ----------
+    name : str
+        The name of the attribute being retrieved.
+
+    Returns
+    -------
+    Attribute
+        Returns the extension attribute, if it exists, otherwise returns the attribute
+        imported in this file.
+    """
+    try:
+        return _PD_EXTENSIONS_.get(name, globals()[name])
+    except KeyError:
+        raise AttributeError(f"module 'modin.pandas' has no attribute '{name}'")
+
 
 __all__ = [  # noqa: F405
+    "_PD_EXTENSIONS_",
     "DataFrame",
     "Series",
     "read_csv",
@@ -327,9 +327,6 @@ __all__ = [  # noqa: F405
     "StringDtype",
     "NA",
     "RangeIndex",
-    "Int64Index",
-    "UInt64Index",
-    "Float64Index",
     "TimedeltaIndex",
     "IntervalIndex",
     "IndexSlice",
@@ -358,7 +355,6 @@ __all__ = [  # noqa: F405
     "to_numeric",
     "unique",
     "value_counts",
-    "datetime",
     "NamedAgg",
     "api",
     "read_xml",
@@ -367,6 +363,7 @@ __all__ = [  # noqa: F405
     "Float32Dtype",
     "Float64Dtype",
     "from_dummies",
+    "errors",
 ]
 
 del pandas, Parameter

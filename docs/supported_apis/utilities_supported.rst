@@ -54,8 +54,6 @@ default to pandas.
 +---------------------------+---------------------------------+----------------------------------------------------+
 | ``pd.options``            | Y                               |                                                    |
 +---------------------------+---------------------------------+----------------------------------------------------+
-| ``pd.datetime``           | D                               |                                                    |
-+---------------------------+---------------------------------+----------------------------------------------------+
 
 Other objects & structures
 --------------------------
@@ -90,9 +88,6 @@ contributing a distributed version of any of these objects, feel free to open a
 * IntervalDtype
 * PeriodDtype
 * RangeIndex
-* Int64Index
-* UInt64Index
-* Float64Index
 * TimedeltaIndex
 * IntervalIndex
 * IndexSlice
@@ -103,8 +98,6 @@ contributing a distributed version of any of these objects, feel free to open a
 * DateOffset
 * ExcelWriter
 * SparseArray
-* SparseSeries
-* SparseDataFrame
 
 .. _open an issue: https://github.com/modin-project/modin/issues
 .. _pull request: https://github.com/modin-project/modin/pulls

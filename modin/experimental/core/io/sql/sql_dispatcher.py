@@ -15,11 +15,11 @@
 
 import warnings
 
-import pandas
 import numpy as np
+import pandas
 
-from modin.core.io import SQLDispatcher
 from modin.config import NPartitions
+from modin.core.io import SQLDispatcher
 
 
 class ExperimentalSQLDispatcher(SQLDispatcher):
@@ -48,6 +48,8 @@ class ExperimentalSQLDispatcher(SQLDispatcher):
         parse_dates,
         columns,
         chunksize,
+        dtype_backend,
+        dtype,
         partition_column,
         lower_bound,
         upper_bound,
@@ -64,16 +66,13 @@ class ExperimentalSQLDispatcher(SQLDispatcher):
             A new query compiler with imported data for further processing.
         """
         # sql deps are optional, so import only when needed
-        from modin.experimental.core.io.sql.utils import (
-            is_distributed,
-            get_query_info,
-        )
+        from modin.experimental.core.io.sql.utils import get_query_info, is_distributed
 
         if not is_distributed(partition_column, lower_bound, upper_bound):
             message = "Defaulting to Modin core implementation; \
                 'partition_column', 'lower_bound', 'upper_bound' must be different from None"
             warnings.warn(message)
-            return cls.base_io.read_sql(
+            return cls.base_read(
                 sql,
                 con,
                 index_col,
@@ -82,6 +81,8 @@ class ExperimentalSQLDispatcher(SQLDispatcher):
                 parse_dates=parse_dates,
                 columns=columns,
                 chunksize=chunksize,
+                dtype_backend=dtype_backend,
+                dtype=dtype,
             )
         #  starts the distributed alternative
         cols_names, query = get_query_info(sql, con, partition_column)
@@ -117,6 +118,8 @@ class ExperimentalSQLDispatcher(SQLDispatcher):
                     parse_dates,
                     columns,
                     chunksize,
+                    dtype_backend,
+                    dtype,
                 ),
                 num_returns=num_splits + 1,
             )

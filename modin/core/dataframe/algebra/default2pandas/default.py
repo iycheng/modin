@@ -13,11 +13,11 @@
 
 """Module houses default functions builder class."""
 
-from modin.core.dataframe.algebra import Operator
-from modin.utils import try_cast_to_pandas, MODIN_UNNAMED_SERIES_LABEL
-
-from pandas.core.dtypes.common import is_list_like
 import pandas
+from pandas.core.dtypes.common import is_list_like
+
+from modin.core.dataframe.algebra.operator import Operator
+from modin.utils import MODIN_UNNAMED_SERIES_LABEL, try_cast_to_pandas
 
 
 class ObjTypeDeterminer:
@@ -103,7 +103,7 @@ class DefaultMethod(Operator):
         else:
             fn = func
 
-        if type(fn) == property:
+        if type(fn) is property:
             fn = cls.build_property_wrapper(fn)
 
         def applyier(df, *args, **kwargs):
@@ -122,8 +122,17 @@ class DefaultMethod(Operator):
             if (
                 not isinstance(result, pandas.Series)
                 and not isinstance(result, pandas.DataFrame)
-                and func != "to_numpy"
-                and func != pandas.DataFrame.to_numpy
+                and func not in ("to_numpy", pandas.DataFrame.to_numpy)
+                and func not in ("align", pandas.DataFrame.align)
+                and func not in ("divmod", pandas.Series.divmod)
+                and func not in ("rdivmod", pandas.Series.rdivmod)
+                and func not in ("to_list", pandas.Series.to_list)
+                and func not in ("corr", pandas.Series.corr)
+                and func not in ("to_dict", pandas.Series.to_dict)
+                and func not in ("mean", pandas.DataFrame.mean)
+                and func not in ("median", pandas.DataFrame.median)
+                and func not in ("skew", pandas.DataFrame.skew)
+                and func not in ("kurt", pandas.DataFrame.kurt)
             ):
                 # When applying a DatetimeProperties or TimedeltaProperties function,
                 # if we don't specify the dtype for the DataFrame, the frame might

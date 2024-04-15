@@ -13,7 +13,10 @@
 
 """The module defines interface for a partition with pandas storage format and Python engine."""
 
+import warnings
+
 from modin.core.dataframe.pandas.partitioning.partition import PandasDataframePartition
+from modin.core.execution.python.common import PythonWrapper
 
 
 class PandasOnPythonDataframePartition(PandasDataframePartition):
@@ -41,7 +44,10 @@ class PandasOnPythonDataframePartition(PandasDataframePartition):
     subclasses. There is no logic for updating in-place.
     """
 
+    execution_wrapper = PythonWrapper
+
     def __init__(self, data, length=None, width=None, call_queue=None):
+        super().__init__()
         if hasattr(data, "copy"):
             data = data.copy()
         self._data = data
@@ -112,7 +118,9 @@ class PandasOnPythonDataframePartition(PandasDataframePartition):
 
         self._data = call_queue_closure(self._data, self.call_queue)
         self.call_queue = []
-        return self.__constructor__(func(self._data.copy(), *args, **kwargs))
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=FutureWarning)
+            return self.__constructor__(func(self._data.copy(), *args, **kwargs))
 
     def drain_call_queue(self):
         """Execute all operations stored in the call queue on the object wrapped by this partition."""

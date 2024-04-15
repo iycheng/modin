@@ -29,18 +29,26 @@ An illustration is available at
 https://github.com/ray-project/ray/pull/1955#issuecomment-386781826
 """
 
+from __future__ import annotations
+
+import itertools
+from typing import TYPE_CHECKING, Union
+
 import numpy as np
 import pandas
-import itertools
-from pandas.api.types import is_list_like, is_bool
-from pandas.core.dtypes.common import is_integer, is_bool_dtype, is_integer_dtype
+from pandas.api.types import is_bool, is_list_like
+from pandas.core.dtypes.common import is_bool_dtype, is_integer, is_integer_dtype
 from pandas.core.indexing import IndexingError
+
 from modin.error_message import ErrorMessage
 from modin.logging import ClassLogger
 
 from .dataframe import DataFrame
 from .series import Series
-from .utils import is_scalar, broadcast_item
+from .utils import is_scalar
+
+if TYPE_CHECKING:
+    from modin.core.storage_formats import BaseQueryCompiler
 
 
 def is_slice(x):
@@ -271,11 +279,14 @@ class _LocationIndexerBase(ClassLogger):
 
     Parameters
     ----------
-    modin_df : modin.pandas.DataFrame
+    modin_df : Union[DataFrame, Series]
         DataFrame to operate on.
     """
 
-    def __init__(self, modin_df):
+    df: Union[DataFrame, Series]
+    qc: BaseQueryCompiler
+
+    def __init__(self, modin_df: Union[DataFrame, Series]):
         self.df = modin_df
         self.qc = modin_df._query_compiler
 
@@ -288,9 +299,7 @@ class _LocationIndexerBase(ClassLogger):
                 if Ellipsis in key:
                     raise IndexingError(_one_ellipsis_message)
                 return self._validate_key_length(key)
-            raise IndexingError(
-                f"Too many indexers: you're trying to pass {len(key)} indexers to the {type(self.df)} having only {self.df.ndim} dimensions."
-            )
+            raise IndexingError("Too many indexers")
         return key
 
     def __getitem__(self, key):  # pragma: no cover
@@ -388,9 +397,7 @@ class _LocationIndexerBase(ClassLogger):
                 None
                 if (col_scalar and row_scalar)
                 or (row_multiindex_full_lookup and col_multiindex_full_lookup)
-                else 1
-                if col_scalar or col_multiindex_full_lookup
-                else 0
+                else 1 if col_scalar or col_multiindex_full_lookup else 0
             )
 
         res_df = self.df.__constructor__(query_compiler=qc_view)
@@ -435,27 +442,12 @@ class _LocationIndexerBase(ClassLogger):
             assert len(row_lookup) == 1
             new_qc = self.qc.setitem(1, self.qc.index[row_lookup[0]], item)
             self.df._create_or_update_from_compiler(new_qc, inplace=True)
+            self.qc = self.df._query_compiler
         # Assignment to both axes.
         else:
-            if not is_scalar(item):
-                item = broadcast_item(self.df, row_lookup, col_lookup, item)
-            self._write_items(row_lookup, col_lookup, item)
-
-    def _write_items(self, row_lookup, col_lookup, item):
-        """
-        Perform remote write and replace blocks.
-
-        Parameters
-        ----------
-        row_lookup : slice or scalar
-            The global row index to write item to.
-        col_lookup : slice or scalar
-            The global col index to write item to.
-        item : numpy.ndarray
-            The new item value that needs to be assigned to `self`.
-        """
-        new_qc = self.qc.write_items(row_lookup, col_lookup, item)
-        self.df._create_or_update_from_compiler(new_qc, inplace=True)
+            new_qc = self.qc.write_items(row_lookup, col_lookup, item)
+            self.df._create_or_update_from_compiler(new_qc, inplace=True)
+            self.qc = self.df._query_compiler
 
     def _determine_setitem_axis(self, row_lookup, col_lookup, row_scalar, col_scalar):
         """
@@ -490,9 +482,11 @@ class _LocationIndexerBase(ClassLogger):
             return self.qc.index if axis == 0 else self.qc.columns
 
         row_lookup_len, col_lookup_len = [
-            len(lookup)
-            if not isinstance(lookup, slice)
-            else compute_sliced_len(lookup, len(get_axis(i)))
+            (
+                len(lookup)
+                if not isinstance(lookup, slice)
+                else compute_sliced_len(lookup, len(get_axis(i)))
+            )
             for i, lookup in enumerate([row_lookup, col_lookup])
         ]
 
@@ -581,6 +575,9 @@ class _LocationIndexerBase(ClassLogger):
         masked_df = self.df.__constructor__(
             query_compiler=self.qc.getitem_array(row_loc._query_compiler)
         )
+        if isinstance(masked_df, Series):
+            assert col_loc == slice(None)
+            return masked_df
         # Passing `slice(None)` as a row indexer since we've just applied it
         return type(self)(masked_df)[(slice(None), col_loc)]
 
@@ -624,7 +621,7 @@ class _LocIndexer(_LocationIndexerBase):
 
     Parameters
     ----------
-    modin_df : modin.pandas.DataFrame
+    modin_df : Union[DataFrame, Series]
         DataFrame to operate on.
     """
 
@@ -823,39 +820,33 @@ class _LocIndexer(_LocationIndexerBase):
         ----------
         row_loc : scalar, slice, list, array or tuple
             Row locator.
-        col_loc : scalar, slice, list, array or tuple
+        col_loc : list, array or tuple
             Columns locator.
         item : modin.pandas.DataFrame, modin.pandas.Series or scalar
             Value that should be assigned to located dataset.
         """
-        exist_items = item
-        common_label_loc = np.isin(col_loc, self.qc.columns.values)
         if is_list_like(item) and not isinstance(item, (DataFrame, Series)):
             item = np.array(item)
             if len(item.shape) == 1:
-                if item.shape[0] != len(col_loc):
+                if len(col_loc) != 1:
                     raise ValueError(
                         "Must have equal len keys and value when setting with an iterable"
                     )
             else:
-                if item.shape != (len(self.qc.index, len(col_loc))):
+                if item.shape[-1] != len(col_loc):
                     raise ValueError(
                         "Must have equal len keys and value when setting with an iterable"
                     )
-            exist_items = (
-                item[:, common_label_loc]
-                if len(item.shape) > 1
-                else item[common_label_loc]
-            )
+        common_label_loc = np.isin(col_loc, self.qc.columns.values)
         if not all(common_label_loc):
             # In this case we have some new cols and some old ones
             columns = self.qc.columns
             for i in range(len(common_label_loc)):
                 if not common_label_loc[i]:
                     columns = columns.insert(len(columns), col_loc[i])
-            self.qc = self.qc.reindex(labels=columns, axis=1, fill_value=0)
+            self.qc = self.qc.reindex(labels=columns, axis=1, fill_value=np.NaN)
             self.df._update_inplace(new_query_compiler=self.qc)
-        self._set_item_existing_loc(row_loc, np.array(col_loc), exist_items)
+        self._set_item_existing_loc(row_loc, np.array(col_loc), item)
 
     def _set_item_existing_loc(self, row_loc, col_loc, item):
         """
@@ -882,6 +873,11 @@ class _LocIndexer(_LocationIndexerBase):
             return
 
         row_lookup, col_lookup = self.qc.get_positions_from_labels(row_loc, col_loc)
+        if isinstance(item, np.ndarray) and is_boolean_array(row_loc):
+            # fix for 'test_loc_series'; np.log(Series) returns nd.array instead
+            # of Series as it was before (`Series.__array_wrap__` is removed)
+            # otherwise incompatible shapes are obtained
+            item = item.take(row_lookup)
         self._setitem_positional(
             row_lookup,
             col_lookup,
@@ -980,7 +976,7 @@ class _iLocIndexer(_LocationIndexerBase):
 
     Parameters
     ----------
-    modin_df : modin.pandas.DataFrame
+    modin_df : Union[DataFrame, Series]
         DataFrame to operate on.
     """
 

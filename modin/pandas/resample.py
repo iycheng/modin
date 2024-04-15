@@ -13,34 +13,44 @@
 
 """Implement Resampler public API."""
 
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Optional, Union
+
 import numpy as np
 import pandas
 import pandas.core.resample
+from pandas._libs import lib
 from pandas.core.dtypes.common import is_list_like
-from pandas._libs.lib import no_default
-from typing import Optional
+
 from modin.logging import ClassLogger
+from modin.pandas.utils import cast_function_modin2pandas
 from modin.utils import _inherit_docstrings
+
+if TYPE_CHECKING:
+    from modin.core.storage_formats import BaseQueryCompiler
+    from modin.pandas import DataFrame, Series
 
 
 @_inherit_docstrings(pandas.core.resample.Resampler)
 class Resampler(ClassLogger):
+    _dataframe: Union[DataFrame, Series]
+    _query_compiler: BaseQueryCompiler
+
     def __init__(
         self,
-        dataframe,
+        dataframe: Union[DataFrame, Series],
         rule,
         axis=0,
         closed=None,
         label=None,
         convention="start",
         kind=None,
-        loffset=None,
-        base=0,
         on=None,
         level=None,
         origin="start_day",
         offset=None,
-        group_keys=no_default,
+        group_keys=lib.no_default,
     ):
         self._dataframe = dataframe
         self._query_compiler = dataframe._query_compiler
@@ -52,8 +62,6 @@ class Resampler(ClassLogger):
             "label": label,
             "convention": convention,
             "kind": kind,
-            "loffset": loffset,
-            "base": base,
             "on": on,
             "level": level,
             "origin": origin,
@@ -72,15 +80,14 @@ class Resampler(ClassLogger):
             Groups as specified by resampling arguments.
         """
         df = self._dataframe if self.axis == 0 else self._dataframe.T
+        convention = self.resample_kwargs["convention"]
         groups = df.groupby(
             pandas.Grouper(
                 key=self.resample_kwargs["on"],
                 freq=self.resample_kwargs["rule"],
                 closed=self.resample_kwargs["closed"],
                 label=self.resample_kwargs["label"],
-                convention=self.resample_kwargs["convention"],
-                loffset=self.resample_kwargs["loffset"],
-                base=self.resample_kwargs["base"],
+                convention=convention if convention is not lib.no_default else "start",
                 level=self.resample_kwargs["level"],
                 origin=self.resample_kwargs["origin"],
                 offset=self.resample_kwargs["offset"],
@@ -138,10 +145,14 @@ class Resampler(ClassLogger):
         )
 
     def get_group(self, name, obj=None):
-        group = self.__groups.get_group(name)
-        return group if self.axis == 0 else group.T
+        return self._dataframe.__constructor__(
+            query_compiler=self._query_compiler.resample_get_group(
+                self.resample_kwargs, name, obj
+            )
+        )
 
     def apply(self, func, *args, **kwargs):
+        func = cast_function_modin2pandas(func)
         from .dataframe import DataFrame
 
         if isinstance(self._dataframe, DataFrame):
@@ -204,32 +215,10 @@ class Resampler(ClassLogger):
         )
 
     def ffill(self, limit=None):
-        return self._dataframe.__constructor__(
-            query_compiler=self._query_compiler.resample_ffill(
-                self.resample_kwargs, limit
-            )
-        )
-
-    def backfill(self, limit=None):
-        return self._dataframe.__constructor__(
-            query_compiler=self._query_compiler.resample_backfill(
-                self.resample_kwargs, limit
-            )
-        )
+        return self.fillna(method="ffill", limit=limit)
 
     def bfill(self, limit=None):
-        return self._dataframe.__constructor__(
-            query_compiler=self._query_compiler.resample_bfill(
-                self.resample_kwargs, limit
-            )
-        )
-
-    def pad(self, limit=None):
-        return self._dataframe.__constructor__(
-            query_compiler=self._query_compiler.resample_pad(
-                self.resample_kwargs, limit
-            )
-        )
+        return self.fillna(method="bfill", limit=limit)
 
     def nearest(self, limit=None):
         return self._dataframe.__constructor__(
@@ -255,24 +244,25 @@ class Resampler(ClassLogger):
     def interpolate(
         self,
         method="linear",
+        *,
         axis=0,
         limit=None,
         inplace=False,
         limit_direction: Optional[str] = None,
         limit_area=None,
-        downcast=None,
+        downcast=lib.no_default,
         **kwargs,
     ):
         return self._dataframe.__constructor__(
             query_compiler=self._query_compiler.resample_interpolate(
                 self.resample_kwargs,
                 method,
-                axis,
-                limit,
-                inplace,
-                limit_direction,
-                limit_area,
-                downcast,
+                axis=axis,
+                limit=limit,
+                inplace=inplace,
+                limit_direction=limit_direction,
+                limit_area=limit_area,
+                downcast=downcast,
                 **kwargs,
             )
         )
@@ -364,15 +354,22 @@ class Resampler(ClassLogger):
             )
 
     def prod(self, min_count=0, *args, **kwargs):
-        prod = self.__groups.prod(min_count=min_count, *args, **kwargs)
-        return prod if self.axis == 0 else prod.T
+        return self._dataframe.__constructor__(
+            query_compiler=self._query_compiler.resample_prod(
+                self.resample_kwargs, min_count=min_count, *args, **kwargs
+            )
+        )
 
     def size(self):
         from .series import Series
 
-        return Series(
+        output_series = Series(
             query_compiler=self._query_compiler.resample_size(self.resample_kwargs)
         )
+        if not isinstance(self._dataframe, Series):
+            # If input is a DataFrame, rename output Series to None
+            return output_series.rename(None)
+        return output_series
 
     def sem(self, *args, **kwargs):
         return self._dataframe.__constructor__(
@@ -391,8 +388,11 @@ class Resampler(ClassLogger):
         )
 
     def sum(self, min_count=0, *args, **kwargs):
-        _sum = self.__groups.sum(min_count=min_count, *args, **kwargs)
-        return _sum if self.axis == 0 else _sum.T
+        return self._dataframe.__constructor__(
+            query_compiler=self._query_compiler.resample_sum(
+                self.resample_kwargs, min_count=min_count, *args, **kwargs
+            )
+        )
 
     def var(self, ddof=1, *args, **kwargs):
         return self._dataframe.__constructor__(

@@ -13,22 +13,24 @@
 
 """Module provides a partition manager class for ``HdkOnNativeDataframe`` frame."""
 
-from modin.error_message import ErrorMessage
-from modin.pandas.utils import is_scalar
-import numpy as np
+import re
 
+import numpy as np
+import pandas
+import pyarrow
+
+from modin.config import DoUseCalcite
 from modin.core.dataframe.pandas.partitioning.partition_manager import (
     PandasDataframePartitionManager,
 )
-from ..partitioning.partition import HdkOnNativeDataframePartition
-from ..db_worker import DbWorker
+from modin.error_message import ErrorMessage
+from modin.pandas.utils import is_scalar
+
 from ..calcite_builder import CalciteBuilder
 from ..calcite_serializer import CalciteSerializer
-from modin.config import DoUseCalcite
-
-import pyarrow
-import pandas
-import re
+from ..dataframe.utils import ColNameCodec, is_supported_arrow_type
+from ..db_worker import DbTable, DbWorker
+from ..partitioning.partition import HdkOnNativeDataframePartition
 
 
 class HdkOnNativeDataframePartitionManager(PandasDataframePartitionManager):
@@ -45,22 +47,9 @@ class HdkOnNativeDataframePartitionManager(PandasDataframePartitionManager):
     _partition_class = HdkOnNativeDataframePartition
 
     @classmethod
-    def _compute_num_partitions(cls):
+    def from_pandas(cls, df, return_dims=False, encode_col_names=True):
         """
-        Return a number of partitions a frame should be split to.
-
-        `HdkOnNativeDataframe` always has a single partition.
-
-        Returns
-        -------
-        int
-        """
-        return 1
-
-    @classmethod
-    def from_pandas(cls, df, return_dims=False):
-        """
-        Create ``HdkOnNativeDataframe`` from ``pandas.DataFrame``.
+        Build partitions from a ``pandas.DataFrame``.
 
         Parameters
         ----------
@@ -68,6 +57,8 @@ class HdkOnNativeDataframePartitionManager(PandasDataframePartitionManager):
             Source frame.
         return_dims : bool, default: False
             Include resulting dimensions into the returned value.
+        encode_col_names : bool, default: True
+            Encode column names.
 
         Returns
         -------
@@ -75,43 +66,19 @@ class HdkOnNativeDataframePartitionManager(PandasDataframePartitionManager):
             Tuple holding array of partitions, list of columns with unsupported
             data and optionally partitions' dimensions.
         """
-        at, unsupported_cols = cls._get_unsupported_cols(df)
-
-        if len(unsupported_cols) > 0:
-            # Putting pandas frame into partitions instead of arrow table, because we know
-            # that all of operations with this frame will be default to pandas and don't want
-            # unnecessaries conversion pandas->arrow->pandas
-
-            def tuple_wrapper(obj):
-                """
-                Wrap non-tuple object into a tuple.
-
-                Parameters
-                ----------
-                obj : Any.
-                    Wrapped object.
-
-                Returns
-                -------
-                tuple
-                """
-                if not isinstance(obj, tuple):
-                    obj = (obj,)
-                return obj
-
-            return (
-                *tuple_wrapper(super().from_pandas(df, return_dims)),
-                unsupported_cols,
-            )
+        unsupported_cols = cls._get_unsupported_cols(df)
+        parts = np.array([[cls._partition_class(df)]])
+        if not return_dims:
+            return parts, unsupported_cols
         else:
-            # Since we already have arrow table, putting it into partitions instead
-            # of pandas frame, to skip that phase when we will be putting our frame to HDK
-            return cls.from_arrow(at, return_dims, unsupported_cols)
+            return parts, [len(df)], [len(df.columns)], unsupported_cols
 
     @classmethod
-    def from_arrow(cls, at, return_dims=False, unsupported_cols=None):
+    def from_arrow(
+        cls, at, return_dims=False, unsupported_cols=None, encode_col_names=True
+    ):
         """
-        Build frame from Arrow table.
+        Build partitions from a ``pyarrow.Table``.
 
         Parameters
         ----------
@@ -122,6 +89,8 @@ class HdkOnNativeDataframePartitionManager(PandasDataframePartitionManager):
         unsupported_cols : list of str, optional
             List of columns holding unsupported data. If None then
             check all columns to compute the list.
+        encode_col_names : bool, default: True
+            Encode column names.
 
         Returns
         -------
@@ -129,18 +98,22 @@ class HdkOnNativeDataframePartitionManager(PandasDataframePartitionManager):
             Tuple holding array of partitions, list of columns with unsupported
             data and optionally partitions' dimensions.
         """
-        put_func = cls._partition_class.put_arrow
+        if encode_col_names:
+            encoded_names = [ColNameCodec.encode(n) for n in at.column_names]
+            encoded_at = at
+            if encoded_names != at.column_names:
+                encoded_at = at.rename_columns(encoded_names)
+        else:
+            encoded_at = at
 
-        parts = [[put_func(at)]]
+        parts = np.array([[cls._partition_class(encoded_at)]])
         if unsupported_cols is None:
-            _, unsupported_cols = cls._get_unsupported_cols(at)
+            unsupported_cols = cls._get_unsupported_cols(at)
 
         if not return_dims:
-            return np.array(parts), unsupported_cols
+            return parts, unsupported_cols
         else:
-            row_lengths = [at.num_rows]
-            col_widths = [at.num_columns]
-            return np.array(parts), row_lengths, col_widths, unsupported_cols
+            return parts, [at.num_rows], [at.num_columns], unsupported_cols
 
     @classmethod
     def _get_unsupported_cols(cls, obj):
@@ -154,9 +127,8 @@ class HdkOnNativeDataframePartitionManager(PandasDataframePartitionManager):
 
         Returns
         -------
-        tuple
-            Arrow representation of `obj` (for future using) and a list of
-            unsupported columns.
+        list
+            List of unsupported columns.
         """
         if isinstance(obj, (pandas.Series, pandas.DataFrame)):
             # picking first rows from cols with `dtype="object"` to check its actual type,
@@ -177,10 +149,10 @@ class HdkOnNativeDataframePartitionManager(PandasDataframePartitionManager):
                 ]
 
             if len(unsupported_cols) > 0:
-                return None, unsupported_cols
+                return unsupported_cols
 
             try:
-                at = pyarrow.Table.from_pandas(obj, preserve_index=False)
+                schema = pyarrow.Schema.from_pandas(obj, preserve_index=False)
             except (
                 pyarrow.lib.ArrowTypeError,
                 pyarrow.lib.ArrowInvalid,
@@ -190,7 +162,7 @@ class HdkOnNativeDataframePartitionManager(PandasDataframePartitionManager):
                 # The TypeError could be raised when converting a sparse data to
                 # arrow table - https://github.com/apache/arrow/pull/4497. If this
                 # is the case - fall back to pandas, otherwise - rethrow the error.
-                if type(err) == TypeError:
+                if type(err) is TypeError:
                     if any([isinstance(t, pandas.SparseDtype) for t in obj.dtypes]):
                         ErrorMessage.single_warning(
                             "Sparse data is not currently supported!"
@@ -202,7 +174,7 @@ class HdkOnNativeDataframePartitionManager(PandasDataframePartitionManager):
                 # We catch and handle this error here. If there are no duplicates
                 # (is_unique is True), then the error is caused by something different
                 # and we just rethrow it.
-                if (type(err) == ValueError) and obj.columns.is_unique:
+                if (type(err) is ValueError) and obj.columns.is_unique:
                     raise err
 
                 regex = r"Conversion failed for column ([^\W]*)"
@@ -212,33 +184,17 @@ class HdkOnNativeDataframePartitionManager(PandasDataframePartitionManager):
                     unsupported_cols.extend(match)
 
                 if len(unsupported_cols) == 0:
-                    unsupported_cols = obj.columns
-                return None, unsupported_cols
-            else:
-                obj = at
+                    unsupported_cols = obj.columns.tolist()
+                return unsupported_cols
+        else:
+            schema = obj.schema
 
-        def is_supported_dtype(dtype):
-            """Check whether the passed pyarrow `dtype` is supported by HDK."""
-            if (
-                pyarrow.types.is_string(dtype)
-                or pyarrow.types.is_time(dtype)
-                or pyarrow.types.is_dictionary(dtype)
-                or pyarrow.types.is_null(dtype)
-            ):
-                return True
-            try:
-                pandas_dtype = dtype.to_pandas_dtype()
-                return pandas_dtype != np.dtype("O")
-            except NotImplementedError:
-                return False
-
-        return (
-            obj,
-            [field.name for field in obj.schema if not is_supported_dtype(field.type)],
-        )
+        return [
+            field.name for field in schema if not is_supported_arrow_type(field.type)
+        ]
 
     @classmethod
-    def run_exec_plan(cls, plan, index_cols, dtypes, columns):
+    def run_exec_plan(cls, plan):
         """
         Run execution plan in HDK storage format to materialize frame.
 
@@ -246,68 +202,70 @@ class HdkOnNativeDataframePartitionManager(PandasDataframePartitionManager):
         ----------
         plan : DFAlgNode
             A root of an execution plan tree.
-        index_cols : list of str
-            A list of index columns.
-        dtypes : pandas.Index
-            Column data types.
-        columns : list of str
-            A frame column names.
 
         Returns
         -------
         np.array
             Created frame's partitions.
         """
-        omniSession = DbWorker()
+        worker = DbWorker()
 
         # First step is to make sure all partitions are in HDK.
         frames = plan.collect_frames()
         for frame in frames:
-            if frame._partitions.size != 1:
-                raise NotImplementedError(
-                    "HdkOnNative engine doesn't suport partitioned frames"
-                )
-            for p in frame._partitions.flatten():
-                if p.frame_id is None:
-                    obj = p.get()
-                    if isinstance(obj, (pandas.DataFrame, pandas.Series)):
-                        p.frame_id = omniSession.import_pandas_dataframe(obj)
-                    else:
-                        assert isinstance(obj, pyarrow.Table)
-                        if obj.num_columns == 0:
-                            # Tables without columns are not supported.
-                            # Creating an empty table with index columns only.
-                            idx_names = (
-                                frame._index_cache.names
-                                if frame._index_cache is not None
-                                else [None]
-                            )
-                            idx_names = frame._mangle_index_names(idx_names)
-                            obj = pyarrow.table(
-                                {n: [] for n in idx_names},
-                                schema=pyarrow.schema(
-                                    {n: pyarrow.int64() for n in idx_names}
-                                ),
-                            )
-                        p.frame_id = omniSession.import_arrow_table(obj)
+            cls.import_table(frame, worker)
 
-        calcite_plan = CalciteBuilder().build(plan)
+        builder = CalciteBuilder()
+        calcite_plan = builder.build(plan)
         calcite_json = CalciteSerializer().serialize(calcite_plan)
-
-        cmd_prefix = "execute relalg "
-
         if DoUseCalcite.get():
-            cmd_prefix = "execute calcite "
-
-        at = omniSession.executeRA(cmd_prefix + calcite_json)
+            exec_calcite = True
+            calcite_json = "execute calcite " + calcite_json
+        else:
+            exec_calcite = False
+        exec_args = {}
+        if builder.has_groupby and not builder.has_join:
+            exec_args = {"enable_lazy_fetch": 0, "enable_columnar_output": 0}
+        elif not builder.has_groupby and builder.has_join:
+            exec_args = {"enable_lazy_fetch": 1, "enable_columnar_output": 1}
+        table = worker.executeRA(calcite_json, exec_calcite, **exec_args)
 
         res = np.empty((1, 1), dtype=np.dtype(object))
-        # workaround for https://github.com/modin-project/modin/issues/1851
-        if DoUseCalcite.get():
-            at = at.rename_columns(["F_" + str(c) for c in columns])
-        res[0][0] = cls._partition_class.put_arrow(at)
+        res[0][0] = cls._partition_class(table)
 
         return res
+
+    @classmethod
+    def import_table(cls, frame, worker=DbWorker()) -> DbTable:
+        """
+        Import the frame's partition data, if required.
+
+        Parameters
+        ----------
+        frame : HdkOnNativeDataframe
+        worker : DbWorker, optional
+
+        Returns
+        -------
+        DbTable
+        """
+        part = frame._partitions[0][0]
+        table = part.get(part.raw)
+        if isinstance(table, pyarrow.Table):
+            if table.num_columns == 0:
+                # Tables without columns are not supported.
+                # Creating an empty table with index columns only.
+                idx_names = (
+                    frame.index.names if frame.has_materialized_index else [None]
+                )
+                idx_names = ColNameCodec.mangle_index_names(idx_names)
+                table = pyarrow.table(
+                    {n: [] for n in idx_names},
+                    schema=pyarrow.schema({n: pyarrow.int64() for n in idx_names}),
+                )
+            table = worker.import_arrow_table(table)
+            frame._partitions[0][0] = cls._partition_class(table)
+        return table
 
     @classmethod
     def _names_from_index_cols(cls, cols):
@@ -345,7 +303,7 @@ class HdkOnNativeDataframePartitionManager(PandasDataframePartitionManager):
         -------
         str
         """
-        if col.startswith("__index__"):
+        if col.startswith(ColNameCodec.IDX_COL_NAME):
             return None
         return col
 

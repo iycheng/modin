@@ -15,10 +15,12 @@
 
 import pandas
 
-from .tree_reduce import TreeReduce
-from .default2pandas.groupby import GroupBy, GroupByDefault
-from modin.utils import hashable, MODIN_UNNAMED_SERIES_LABEL
+from modin.core.dataframe.pandas.metadata import ModinIndex
 from modin.error_message import ErrorMessage
+from modin.utils import MODIN_UNNAMED_SERIES_LABEL, hashable
+
+from .default2pandas.groupby import GroupBy, GroupByDefault
+from .tree_reduce import TreeReduce
 
 
 class GroupByReduce(TreeReduce):
@@ -201,6 +203,7 @@ class GroupByReduce(TreeReduce):
         partition_idx=0,
         drop=False,
         method=None,
+        finalizer_fn=None,
     ):
         """
         Execute Reduce phase of GroupByReduce.
@@ -228,6 +231,8 @@ class GroupByReduce(TreeReduce):
             Indicates whether or not by-data came from the `self` frame.
         method : str, optional
             Name of the groupby function. This is a hint to be able to do special casing.
+        finalizer_fn : callable(pandas.DataFrame) -> pandas.DataFrame, default: None
+            A callable to execute at the end a groupby kernel against groupby result.
 
         Returns
         -------
@@ -240,7 +245,7 @@ class GroupByReduce(TreeReduce):
         by_part = pandas.Index(df.index.names)
 
         groupby_kwargs = groupby_kwargs.copy()
-        as_index = groupby_kwargs["as_index"]
+        as_index = groupby_kwargs.get("as_index", True)
 
         # Set `as_index` to True to track the metadata of the grouping object
         groupby_kwargs["as_index"] = True
@@ -272,7 +277,11 @@ class GroupByReduce(TreeReduce):
                 inplace=True,
             )
         # Result could not always be a frame, so wrapping it into DataFrame
-        return pandas.DataFrame(result)
+        result = pandas.DataFrame(result)
+        if result.index.name == MODIN_UNNAMED_SERIES_LABEL:
+            result.index.name = None
+
+        return result if finalizer_fn is None else finalizer_fn(result)
 
     @classmethod
     def caller(
@@ -288,6 +297,7 @@ class GroupByReduce(TreeReduce):
         drop=False,
         method=None,
         default_to_pandas_func=None,
+        finalizer_fn=None,
     ):
         """
         Execute GroupBy aggregation with TreeReduce approach.
@@ -318,6 +328,8 @@ class GroupByReduce(TreeReduce):
         default_to_pandas_func : callable(pandas.DataFrameGroupBy) -> pandas.DataFrame, optional
             The pandas aggregation function equivalent to the `map_func + reduce_func`.
             Used in case of defaulting to pandas. If not specified `map_func` is used.
+        finalizer_fn : callable(pandas.DataFrame) -> pandas.DataFrame, default: None
+            A callable to execute at the end a groupby kernel against groupby result.
 
         Returns
         -------
@@ -367,7 +379,7 @@ class GroupByReduce(TreeReduce):
         if not groupby_kwargs.get("sort", True) and isinstance(
             by, type(query_compiler)
         ):
-            ErrorMessage.missmatch_with_pandas(
+            ErrorMessage.mismatch_with_pandas(
                 operation="df.groupby(categorical_by, sort=False)",
                 message=(
                     "the groupby keys will be sorted anyway, although the 'sort=False' was passed. "
@@ -388,6 +400,7 @@ class GroupByReduce(TreeReduce):
             agg_kwargs=agg_kwargs,
             drop=drop,
             method=method,
+            finalizer_fn=finalizer_fn,
         )
 
         # If `by` is a ModinFrame, then its partitions will be broadcasted to every
@@ -395,13 +408,29 @@ class GroupByReduce(TreeReduce):
         # Otherwise `by` was already bound to the Map function in `build_map_reduce_functions`.
         broadcastable_by = getattr(by, "_modin_frame", None)
         apply_indices = list(map_func.keys()) if isinstance(map_func, dict) else None
+        if (
+            broadcastable_by is not None
+            and groupby_kwargs.get("as_index", True)
+            and broadcastable_by.has_materialized_dtypes
+        ):
+            new_index = ModinIndex(
+                # actual value will be assigned on a parent update
+                value=None,
+                axis=0,
+                dtypes=broadcastable_by.dtypes,
+            )
+        else:
+            new_index = None
         new_modin_frame = query_compiler._modin_frame.groupby_reduce(
-            axis, broadcastable_by, map_fn, reduce_fn, apply_indices=apply_indices
+            axis,
+            broadcastable_by,
+            map_fn,
+            reduce_fn,
+            apply_indices=apply_indices,
+            new_index=new_index,
         )
 
         result = query_compiler.__constructor__(new_modin_frame)
-        if result.index.name == MODIN_UNNAMED_SERIES_LABEL:
-            result.index.name = None
         return result
 
     @classmethod
@@ -640,6 +669,7 @@ class GroupByReduce(TreeReduce):
         agg_kwargs,
         drop=False,
         method=None,
+        finalizer_fn=None,
     ):
         """
         Bind appropriate arguments to map and reduce functions.
@@ -665,6 +695,8 @@ class GroupByReduce(TreeReduce):
             Indicates whether or not by-data came from the `self` frame.
         method : str, optional
             Name of the GroupBy aggregation function. This is a hint to be able to do special casing.
+        finalizer_fn : callable(pandas.DataFrame) -> pandas.DataFrame, default: None
+            A callable to execute at the end a groupby kernel against groupby result.
 
         Returns
         -------
@@ -711,6 +743,7 @@ class GroupByReduce(TreeReduce):
                     agg_kwargs=agg_kwargs,
                     drop=drop,
                     method=method,
+                    finalizer_fn=finalizer_fn,
                     **call_kwargs,
                 )
 

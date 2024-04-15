@@ -15,26 +15,31 @@
 
 import os
 import sys
-import psutil
-from packaging import version
-from typing import Optional
 import warnings
+from typing import Optional
 
+import psutil
 import ray
+from packaging import version
 
 from modin.config import (
-    StorageFormat,
-    IsRayCluster,
-    RayRedisAddress,
-    RayRedisPassword,
+    CIAWSAccessKeyID,
+    CIAWSSecretAccessKey,
     CpuCount,
+    GithubCI,
     GpuCount,
+    IsRayCluster,
     Memory,
     NPartitions,
+    RayRedisAddress,
+    RayRedisPassword,
+    StorageFormat,
     ValueSource,
 )
+from modin.core.execution.utils import set_env
 from modin.error_message import ErrorMessage
-from .engine_wrapper import RayWrapper
+
+from .engine_wrapper import ObjectRefTypes, RayWrapper
 
 _OBJECT_STORE_TO_SYSTEM_MEMORY_RATIO = 0.6
 # This constant should be in sync with the limit in ray, which is private,
@@ -44,11 +49,7 @@ _MAC_OBJECT_STORE_LIMIT_BYTES = 2 * 2**30
 
 _RAY_IGNORE_UNHANDLED_ERRORS_VAR = "RAY_IGNORE_UNHANDLED_ERRORS"
 
-ObjectIDType = ray.ObjectRef
-if version.parse(ray.__version__) >= version.parse("1.2.0"):
-    from ray.util.client.common import ClientObjectRef
-
-    ObjectIDType = (ray.ObjectRef, ClientObjectRef)
+ObjectIDType = ObjectRefTypes
 
 
 def initialize_ray(
@@ -74,14 +75,30 @@ def initialize_ray(
         What password to use when connecting to Redis.
         If not specified, ``modin.config.RayRedisPassword`` is used.
     """
-    extra_init_kw = {"runtime_env": {"env_vars": {"__MODIN_AUTOIMPORT_PANDAS__": "1"}}}
+    # We need these vars to be set for each Ray's worker in order to ensure that
+    # the `pandas` module has been fully imported inside of each process before
+    # any execution begins:
+    # https://github.com/modin-project/modin/pull/4603
+    env_vars = {
+        "__MODIN_AUTOIMPORT_PANDAS__": "1",
+        "PYTHONWARNINGS": "ignore::FutureWarning",
+    }
+    if GithubCI.get():
+        # need these to write parquet to the moto service mocking s3.
+        env_vars.update(
+            {
+                "AWS_ACCESS_KEY_ID": CIAWSAccessKeyID.get(),
+                "AWS_SECRET_ACCESS_KEY": CIAWSSecretAccessKey.get(),
+            }
+        )
+    extra_init_kw = {}
+    is_cluster = override_is_cluster or IsRayCluster.get()
     if not ray.is_initialized() or override_is_cluster:
-        cluster = override_is_cluster or IsRayCluster.get()
         redis_address = override_redis_address or RayRedisAddress.get()
         redis_password = (
             (
                 ray.ray_constants.REDIS_DEFAULT_PASSWORD
-                if cluster
+                if is_cluster
                 else RayRedisPassword.get()
             )
             if override_redis_password is None
@@ -89,7 +106,8 @@ def initialize_ray(
             else override_redis_password or RayRedisPassword.get()
         )
 
-        if cluster:
+        if is_cluster:
+            extra_init_kw["runtime_env"] = {"env_vars": env_vars}
             # We only start ray in a cluster setting for the head node.
             ray.init(
                 address=redis_address or "auto",
@@ -99,15 +117,6 @@ def initialize_ray(
                 **extra_init_kw,
             )
         else:
-            # This string is intentionally formatted this way. We want it indented in
-            # the warning message.
-            ErrorMessage.not_initialized(
-                "Ray",
-                f"""
-    import ray
-    ray.init({', '.join([f'{k}={v}' for k,v in extra_init_kw.items()])})
-""",
-            )
             object_store_memory = _get_object_store_memory()
             ray_init_kwargs = {
                 "num_cpus": CpuCount.get(),
@@ -119,12 +128,19 @@ def initialize_ray(
                 "_memory": object_store_memory,
                 **extra_init_kw,
             }
-            ray.init(**ray_init_kwargs)
+            # It should be enough to simply set the required variables for the main process
+            # for Ray to automatically propagate them to each new worker on the same node.
+            # Although Ray doesn't guarantee this behavior it works as expected most of the
+            # time and doesn't enforce us with any overhead that Ray's native `runtime_env`
+            # is usually causing. You can visit this gh-issue for more info:
+            # https://github.com/modin-project/modin/issues/5157#issuecomment-1500225150
+            with set_env(**env_vars):
+                ray.init(**ray_init_kwargs)
 
         if StorageFormat.get() == "Cudf":
             from modin.core.execution.ray.implementations.cudf_on_ray.partitioning import (
-                GPUManager,
                 GPU_MANAGERS,
+                GPUManager,
             )
 
             # Check that GPU_MANAGERS is empty because _update_engine can be called multiple times
@@ -134,13 +150,14 @@ def initialize_ray(
 
     # Now ray is initialized, check runtime env config - especially useful if we join
     # an externally pre-configured cluster
-    env_vars = ray.get_runtime_context().runtime_env.get("env_vars", {})
-    for varname, varvalue in extra_init_kw["runtime_env"]["env_vars"].items():
-        if str(env_vars.get(varname, "")) != str(varvalue):
-            ErrorMessage.single_warning(
-                "When using a pre-initialized Ray cluster, please ensure that the runtime env "
-                + f"sets environment variable {varname} to {varvalue}"
-            )
+    runtime_env_vars = ray.get_runtime_context().runtime_env.get("env_vars", {})
+    for varname, varvalue in env_vars.items():
+        if str(runtime_env_vars.get(varname, "")) != str(varvalue):
+            if is_cluster:
+                ErrorMessage.single_warning(
+                    "When using a pre-initialized Ray cluster, please ensure that the runtime env "
+                    + f"sets environment variable {varname} to {varvalue}"
+                )
 
     num_cpus = int(ray.cluster_resources()["CPU"])
     num_gpus = int(ray.cluster_resources().get("GPU", 0))
@@ -218,7 +235,7 @@ def _get_object_store_memory() -> Optional[int]:
     return object_store_memory
 
 
-def deserialize(obj):
+def deserialize(obj):  # pragma: no cover
     """
     Deserialize a Ray object.
 
@@ -256,26 +273,3 @@ def deserialize(obj):
         return dict(zip(obj.keys(), RayWrapper.materialize(list(obj.values()))))
     else:
         return obj
-
-
-def wait(obj_ids):
-    """
-    Wrap ``ray.wait`` to handle duplicate object references.
-
-    ``ray.wait`` assumes a list of unique object references: see
-    https://github.com/modin-project/modin/issues/5045
-
-    Parameters
-    ----------
-    obj_ids : List[ObjectIDType]
-        The object IDs to wait on.
-
-    Returns
-    -------
-    Tuple[List[ObjectIDType], List[ObjectIDType]]
-        A list of object IDs that are ready, and a list of object IDs remaining (this
-        is the same as for ``ray.wait``). Unlike ``ray.wait``, the order of these IDs is not
-        guaranteed.
-    """
-    unique_ids = list(set(obj_ids))
-    return ray.wait(unique_ids, num_returns=len(unique_ids))

@@ -1,5 +1,0 @@
-fsspec
-jupyterlab
-ipywidgets
-modin[unidist]
-modin[spreadsheet]

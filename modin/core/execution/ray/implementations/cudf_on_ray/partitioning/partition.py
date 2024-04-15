@@ -13,14 +13,14 @@
 
 """Module houses class that wraps data (block partition) and its metadata."""
 
-import ray
 import cudf
 import cupy
-import numpy as np
 import cupy as cp
+import numpy as np
+import ray
+from pandas.core.dtypes.common import is_list_like
 
 from modin.core.dataframe.pandas.partitioning.partition import PandasDataframePartition
-from pandas.core.dtypes.common import is_list_like
 from modin.core.execution.ray.common import RayWrapper
 from modin.core.execution.ray.common.utils import ObjectIDType
 
@@ -43,6 +43,7 @@ class cuDFOnRayDataframePartition(PandasDataframePartition):
     """
 
     def __init__(self, gpu_manager, key, length=None, width=None):
+        super().__init__()
         self.gpu_manager = gpu_manager
         self.key = key
         self._length_cache = length

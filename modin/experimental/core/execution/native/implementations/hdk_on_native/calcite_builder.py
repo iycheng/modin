@@ -12,40 +12,44 @@
 # governing permissions and limitations under the License.
 
 """Module provides ``CalciteBuilder`` class."""
+from collections import abc
 
+import pandas
+from pandas.core.dtypes.common import _get_dtype, is_bool_dtype
+
+from .calcite_algebra import (
+    CalciteAggregateNode,
+    CalciteBaseNode,
+    CalciteCollation,
+    CalciteFilterNode,
+    CalciteInputIdxExpr,
+    CalciteInputRefExpr,
+    CalciteJoinNode,
+    CalciteProjectionNode,
+    CalciteScanNode,
+    CalciteSortNode,
+    CalciteUnionNode,
+)
+from .dataframe.utils import ColNameCodec
+from .df_algebra import (
+    FilterNode,
+    FrameNode,
+    GroupbyAggNode,
+    JoinNode,
+    MaskNode,
+    SortNode,
+    TransformNode,
+    UnionNode,
+)
 from .expr import (
+    AggregateExpr,
     InputRefExpr,
     LiteralExpr,
-    AggregateExpr,
+    OpExpr,
+    _quantile_agg_dtype,
     build_if_then_else,
     build_row_idx_filter_expr,
 )
-from .calcite_algebra import (
-    CalciteBaseNode,
-    CalciteInputRefExpr,
-    CalciteInputIdxExpr,
-    CalciteScanNode,
-    CalciteProjectionNode,
-    CalciteFilterNode,
-    CalciteAggregateNode,
-    CalciteCollation,
-    CalciteSortNode,
-    CalciteJoinNode,
-    CalciteUnionNode,
-)
-from .df_algebra import (
-    FrameNode,
-    MaskNode,
-    GroupbyAggNode,
-    TransformNode,
-    JoinNode,
-    UnionNode,
-    SortNode,
-    FilterNode,
-)
-
-from collections import abc
-from pandas.core.dtypes.common import get_dtype
 
 
 class CalciteBuilder:
@@ -65,8 +69,8 @@ class CalciteBuilder:
         ----------
         builder : CalciteBuilder
             A builder to use for translation.
-        arg : BaseExpr
-            An aggregated value.
+        arg : BaseExpr or List of BaseExpr
+            An aggregated values.
         """
 
         def __init__(self, builder, arg):
@@ -106,6 +110,53 @@ class CalciteBuilder:
             """
             pass
 
+    class CompoundAggregateWithColArg(CompoundAggregate):
+        """
+        A base class for a compound aggregate that require a `LiteralExpr` column argument.
+
+        This aggregate requires 2 arguments. The first argument is an `InputRefExpr`,
+        refering to the aggregation column. The second argument is a `LiteralExpr`,
+        this expression is added into the frame as a new column.
+
+        Parameters
+        ----------
+        agg : str
+            Aggregate name.
+        builder : CalciteBuilder
+            A builder to use for translation.
+        arg : List of BaseExpr
+            Aggregate arguments.
+        dtype : dtype, optional
+            Aggregate data type. If not specified, `_dtype` from the first argument is used.
+        """
+
+        def __init__(self, agg, builder, arg, dtype=None):
+            assert isinstance(arg[0], InputRefExpr)
+            assert isinstance(arg[1], LiteralExpr)
+            super().__init__(builder, arg)
+            self._agg = agg
+            self._agg_column = f"{arg[0].column}__{agg}__"
+            self._dtype = dtype or arg[0]._dtype
+
+        def gen_proj_exprs(self):
+            return {self._agg_column: self._arg[1]}
+
+        def gen_agg_exprs(self):
+            frame = self._arg[0].modin_frame
+            return {
+                self._agg_column: AggregateExpr(
+                    self._agg,
+                    [
+                        self._builder._ref_idx(frame, self._arg[0].column),
+                        self._builder._ref_idx(frame, self._agg_column),
+                    ],
+                    dtype=self._dtype,
+                )
+            }
+
+        def gen_reduce_expr(self):
+            return self._builder._ref(self._arg[0].modin_frame, self._agg_column)
+
     class StdAggregate(CompoundAggregate):
         """
         A sample standard deviation aggregate generator.
@@ -114,13 +165,13 @@ class CalciteBuilder:
         ----------
         builder : CalciteBuilder
             A builder to use for translation.
-        arg : BaseExpr
+        arg : list of BaseExpr
             An aggregated value.
         """
 
         def __init__(self, builder, arg):
-            assert isinstance(arg, InputRefExpr)
-            super().__init__(builder, arg)
+            assert isinstance(arg[0], InputRefExpr)
+            super().__init__(builder, arg[0])
 
             self._quad_name = self._arg.column + "__quad__"
             self._sum_name = self._arg.column + "__sum__"
@@ -173,7 +224,7 @@ class CalciteBuilder:
                 A final compound aggregate expression.
             """
             count_expr = self._builder._ref(self._arg.modin_frame, self._count_name)
-            count_expr._dtype = get_dtype(int)
+            count_expr._dtype = _get_dtype(int)
             sum_expr = self._builder._ref(self._arg.modin_frame, self._sum_name)
             sum_expr._dtype = self._sum_dtype
             qsum_expr = self._builder._ref(self._arg.modin_frame, self._quad_sum_name)
@@ -205,13 +256,13 @@ class CalciteBuilder:
         ----------
         builder : CalciteBuilder
             A builder to use for translation.
-        arg : BaseExpr
+        arg : list of BaseExpr
             An aggregated value.
         """
 
         def __init__(self, builder, arg):
-            assert isinstance(arg, InputRefExpr)
-            super().__init__(builder, arg)
+            assert isinstance(arg[0], InputRefExpr)
+            super().__init__(builder, arg[0])
 
             self._quad_name = self._arg.column + "__quad__"
             self._cube_name = self._arg.column + "__cube__"
@@ -275,7 +326,7 @@ class CalciteBuilder:
                 A final compound aggregate expression.
             """
             count_expr = self._builder._ref(self._arg.modin_frame, self._count_name)
-            count_expr._dtype = get_dtype(int)
+            count_expr._dtype = _get_dtype(int)
             sum_expr = self._builder._ref(self._arg.modin_frame, self._sum_name)
             sum_expr._dtype = self._sum_dtype
             qsum_expr = self._builder._ref(self._arg.modin_frame, self._quad_sum_name)
@@ -305,7 +356,65 @@ class CalciteBuilder:
                 skew_expr._dtype,
             )
 
-    _compound_aggregates = {"std": StdAggregate, "skew": SkewAggregate}
+    class TopkAggregate(CompoundAggregateWithColArg):
+        """
+        A TOP_K aggregate generator.
+
+        Parameters
+        ----------
+        builder : CalciteBuilder
+            A builder to use for translation.
+        arg : List of BaseExpr
+            An aggregated values.
+        """
+
+        def __init__(self, builder, arg):
+            super().__init__("TOP_K", builder, arg)
+
+        def gen_reduce_expr(self):
+            return OpExpr(
+                "PG_UNNEST",
+                [super().gen_reduce_expr()],
+                self._dtype,
+            )
+
+    class QuantileAggregate(CompoundAggregateWithColArg):
+        """
+        A QUANTILE aggregate generator.
+
+        Parameters
+        ----------
+        builder : CalciteBuilder
+            A builder to use for translation.
+        arg : List of BaseExpr
+            A list of 3 values:
+                0. InputRefExpr - the column to compute the quantiles for.
+                1. LiteralExpr - the quantile value.
+                2. str - the interpolation method to use.
+        """
+
+        def __init__(self, builder, arg):
+            super().__init__(
+                "QUANTILE",
+                builder,
+                arg,
+                _quantile_agg_dtype(arg[0]._dtype),
+            )
+            self._interpolation = arg[2].val.upper()
+
+        def gen_agg_exprs(self):
+            exprs = super().gen_agg_exprs()
+            for expr in exprs.values():
+                expr.interpolation = self._interpolation
+            return exprs
+
+    _compound_aggregates = {
+        "std": StdAggregate,
+        "skew": SkewAggregate,
+        "nlargest": TopkAggregate,
+        "nsmallest": TopkAggregate,
+        "quantile": QuantileAggregate,
+    }
 
     class InputContext:
         """
@@ -397,7 +506,7 @@ class CalciteBuilder:
             if frame in self.replacements:
                 return self.replacements[frame].index(col) + offs
 
-            if col == "__rowid__":
+            if col == ColNameCodec.ROWID_COL_NAME:
                 if not isinstance(self.frame_to_node[frame], CalciteScanNode):
                     raise NotImplementedError(
                         "rowid can be accessed in materialized frames only"
@@ -510,13 +619,9 @@ class CalciteBuilder:
                 expr.agg = self._simple_aggregates[expr.agg]
                 return expr
 
-            copied = False
-            for i, op in enumerate(getattr(expr, "operands", [])):
-                new_op = self._maybe_copy_and_translate_expr(op)
-                if new_op != op:
-                    if not copied:
-                        expr = expr.copy()
-                    expr.operands[i] = new_op
+            gen = expr.nested_expressions()
+            for op in gen:
+                expr = gen.send(self._maybe_copy_and_translate_expr(op))
             return expr
 
     class InputContextMgr:
@@ -584,8 +689,17 @@ class CalciteBuilder:
         bool: "BOOLEAN",
     }
 
+    # The following aggregates require boolean columns to be cast.
+    _bool_cast_aggregates = {
+        "sum": _get_dtype(int),
+        "mean": _get_dtype(float),
+        "quantile": _get_dtype(float),
+    }
+
     def __init__(self):
         self._input_ctx_stack = []
+        self.has_join = False
+        self.has_groupby = False
 
     def build(self, op):
         """
@@ -741,6 +855,20 @@ class CalciteBuilder:
         node : CalciteBaseNode
             A node to add.
         """
+        if (
+            len(self.res) != 0
+            and isinstance(node, CalciteProjectionNode)
+            and isinstance(self.res[-1], CalciteProjectionNode)
+            and all(isinstance(expr, CalciteInputRefExpr) for expr in node.exprs)
+        ):
+            # Replace the last CalciteProjectionNode with this one and
+            # translate the input refs. The `id` attribute is preserved.
+            last = self.res.pop()
+            exprs = last.exprs
+            last.reset_id(int(last.id))
+            node = CalciteProjectionNode(
+                node.fields, [exprs[expr.input] for expr in node.exprs]
+            )
         self.res.append(node)
 
     def _last(self):
@@ -854,7 +982,7 @@ class CalciteBuilder:
         frame = op.input[0]
 
         # select rows by rowid
-        rowid_col = self._ref(frame, "__rowid__")
+        rowid_col = self._ref(frame, ColNameCodec.ROWID_COL_NAME)
         condition = build_row_idx_filter_expr(op.row_positions, rowid_col)
         self._push(CalciteFilterNode(condition))
 
@@ -871,6 +999,7 @@ class CalciteBuilder:
         op : GroupbyAggNode
             An operation to translate.
         """
+        self.has_groupby = True
         frame = op.input[0]
 
         # Aggregation's input should always be a projection and
@@ -879,13 +1008,37 @@ class CalciteBuilder:
         for col in frame._table_cols:
             if col not in op.by:
                 proj_cols.append(col)
-        proj_exprs = [self._ref(frame, col) for col in proj_cols]
+
+        # Cast boolean columns, if required
+        agg_exprs = op.agg_exprs
+        cast_agg = self._bool_cast_aggregates
+        if any(v.agg in cast_agg for v in agg_exprs.values()) and (
+            bool_cols := {
+                c: cast_agg[agg_exprs[c].agg]
+                for c, t in frame.dtypes.items()
+                # Do not call is_bool_dtype() for categorical since it checks all the categories
+                if not isinstance(t, pandas.CategoricalDtype)
+                and is_bool_dtype(t)
+                and agg_exprs[c].agg in cast_agg
+            }
+        ):
+            trans = self._input_ctx()._maybe_copy_and_translate_expr
+            proj_exprs = [
+                (
+                    trans(frame.ref(c).cast(bool_cols[c]))
+                    if c in bool_cols
+                    else self._ref(frame, c)
+                )
+                for c in proj_cols
+            ]
+        else:
+            proj_exprs = [self._ref(frame, col) for col in proj_cols]
         # Add expressions required for compound aggregates
         compound_aggs = {}
-        for agg, expr in op.agg_exprs.items():
+        for agg, expr in agg_exprs.items():
             if expr.agg in self._compound_aggregates:
                 compound_aggs[agg] = self._compound_aggregates[expr.agg](
-                    self, expr.operands[0]
+                    self, expr.operands
                 )
                 extra_exprs = compound_aggs[agg].gen_proj_exprs()
                 proj_cols.extend(extra_exprs.keys())
@@ -898,7 +1051,7 @@ class CalciteBuilder:
         group = [self._ref_idx(frame, col) for col in op.by]
         fields = op.by.copy()
         aggs = []
-        for agg, expr in op.agg_exprs.items():
+        for agg, expr in agg_exprs.items():
             if agg in compound_aggs:
                 extra_aggs = compound_aggs[agg].gen_agg_exprs()
                 fields.extend(extra_aggs.keys())
@@ -913,8 +1066,8 @@ class CalciteBuilder:
             self._input_ctx().replace_input_node(frame, node, fields)
             proj_cols = op.by.copy()
             proj_exprs = [self._ref(frame, col) for col in proj_cols]
-            proj_cols.extend(op.agg_exprs.keys())
-            for agg in op.agg_exprs:
+            proj_cols.extend(agg_exprs.keys())
+            for agg in agg_exprs:
                 if agg in compound_aggs:
                     proj_exprs.append(compound_aggs[agg].gen_reduce_expr())
                 else:
@@ -948,6 +1101,7 @@ class CalciteBuilder:
         op : JoinNode
             An operation to translate.
         """
+        self.has_join = True
         node = CalciteJoinNode(
             left_id=self._input_node(0).id,
             right_id=self._input_node(1).id,

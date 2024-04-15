@@ -6,12 +6,14 @@
 # full list see the documentation:
 # http://www.sphinx-doc.org/en/stable/config
 
+import os
+
 # -- Project information -----------------------------------------------------
 import sys
-import os
 import types
 
 import ray
+
 
 # stub ray.remote to be a no-op so it doesn't shadow docstrings
 def noop_decorator(*args, **kwargs):
@@ -24,7 +26,15 @@ def noop_decorator(*args, **kwargs):
 ray.remote = noop_decorator
 
 # fake modules if they're missing
-for mod_name in ("cudf", "cupy", "pyarrow.gandiva", "pyhdk"):
+for mod_name in (
+    "cudf",
+    "cupy",
+    "pyhdk",
+    "pyhdk.hdk",
+    "xgboost",
+    "unidist",
+    "unidist.config",
+):
     try:
         __import__(mod_name)
     except ImportError:
@@ -37,10 +47,32 @@ if not hasattr(sys.modules["cupy"], "ndarray"):
     sys.modules["cupy"].ndarray = type("ndarray", (object,), {})
 if not hasattr(sys.modules["pyhdk"], "PyDbEngine"):
     sys.modules["pyhdk"].PyDbEngine = type("PyDbEngine", (object,), {})
+if not hasattr(sys.modules["pyhdk.hdk"], "HDK"):
+    sys.modules["pyhdk.hdk"].HDK = type("HDK", (object,), {})
+if not hasattr(sys.modules["pyhdk.hdk"], "QueryNode"):
+    sys.modules["pyhdk.hdk"].QueryNode = type("QueryNode", (object,), {})
+if not hasattr(sys.modules["pyhdk.hdk"], "ExecutionResult"):
+    sys.modules["pyhdk.hdk"].ExecutionResult = type("ExecutionResult", (object,), {})
+if not hasattr(sys.modules["pyhdk.hdk"], "RelAlgExecutor"):
+    sys.modules["pyhdk.hdk"].RelAlgExecutor = type("RelAlgExecutor", (object,), {})
+if not hasattr(sys.modules["pyhdk"], "__version__"):
+    # Show all known pyhdk config options in documentation
+    sys.modules["pyhdk"].__version__ = "999"
+if not hasattr(sys.modules["xgboost"], "Booster"):
+    sys.modules["xgboost"].Booster = type("Booster", (object,), {})
+if not hasattr(sys.modules["unidist"], "remote"):
+    sys.modules["unidist"].remote = noop_decorator
+if not hasattr(sys.modules["unidist"], "core"):
+    sys.modules["unidist"].core = type("core", (object,), {})
+if not hasattr(sys.modules["unidist"].core, "base"):
+    sys.modules["unidist"].core.base = type("base", (object,), {})
+if not hasattr(sys.modules["unidist"].core.base, "object_ref"):
+    sys.modules["unidist"].core.base.object_ref = type("object_ref", (object,), {})
+if not hasattr(sys.modules["unidist"].core.base.object_ref, "ObjectRef"):
+    sys.modules["unidist"].core.base.object_ref.ObjectRef = type("ObjectRef", (object,), {})
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 import modin
-
 from modin.config.__main__ import export_config_help
 
 configs_file_path = os.path.abspath(
@@ -50,7 +82,7 @@ configs_file_path = os.path.abspath(
 export_config_help(configs_file_path)
 
 project = "Modin"
-copyright = "2018-2022, Modin Developers."
+copyright = "2018-2023, Modin Developers."
 author = "Modin contributors"
 
 # The short X.Y version
@@ -154,16 +186,12 @@ html_theme_options = {
             "icon": "fab fa-slack",
         },
         {
-            "name": "Discourse",
-            "url": "https://discuss.modin.org/",
-            "icon": "fab fa-discourse",
-        },
-        {
             "name": "Mailing List",
             "url": "https://groups.google.com/forum/#!forum/modin-dev",
             "icon": "fas fa-envelope-square",
         },
     ],
+    "navigation_with_keys": True,
 }
 
 # Custom sidebar templates, must be a dictionary that maps document names

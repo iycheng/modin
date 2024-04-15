@@ -17,23 +17,24 @@ Module houses `TextFileDispatcher` class.
 `TextFileDispatcher` contains utils for text formats files, inherits util functions for
 files from `FileDispatcher` class and can be used as base class for dipatchers of SQL queries.
 """
-import warnings
-import os
-import io
 import codecs
-from typing import Union, Sequence, Optional, Tuple, Callable
+import io
+import os
+import warnings
 from csv import QUOTE_NONE
+from typing import Callable, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import pandas
 import pandas._libs.lib as lib
 from pandas.core.dtypes.common import is_list_like
+from pandas.io.common import stringify_path
 
+from modin.config import MinPartitionSize, NPartitions
 from modin.core.io.file_dispatcher import FileDispatcher, OpenFile
+from modin.core.io.text.utils import CustomNewlineIterator
 from modin.core.storage_formats.pandas.utils import compute_chunksize
 from modin.utils import _inherit_docstrings
-from modin.core.io.text.utils import CustomNewlineIterator
-from modin.config import NPartitions
 
 ColumnNamesTypes = Tuple[Union[pandas.Index, pandas.MultiIndex]]
 IndexColType = Union[int, str, bool, Sequence[int], Sequence[str], None]
@@ -570,7 +571,8 @@ class TextFileDispatcher(FileDispatcher):
         """
         # This is the number of splits for the columns
         num_splits = min(len(column_names) or 1, NPartitions.get())
-        column_chunksize = compute_chunksize(df.shape[1], num_splits)
+        min_block_size = MinPartitionSize.get()
+        column_chunksize = compute_chunksize(df.shape[1], num_splits, min_block_size)
         if column_chunksize > len(column_names):
             column_widths = [len(column_names)]
             # This prevents us from unnecessarily serializing a bunch of empty
@@ -581,11 +583,15 @@ class TextFileDispatcher(FileDispatcher):
             # if num_splits == 4, len(column_names) == 80 and column_chunksize == 32,
             # column_widths will be [32, 32, 16, 0]
             column_widths = [
-                column_chunksize
-                if len(column_names) > (column_chunksize * (i + 1))
-                else 0
-                if len(column_names) < (column_chunksize * i)
-                else len(column_names) - (column_chunksize * i)
+                (
+                    column_chunksize
+                    if len(column_names) > (column_chunksize * (i + 1))
+                    else (
+                        0
+                        if len(column_names) < (column_chunksize * i)
+                        else len(column_names) - (column_chunksize * i)
+                    )
+                )
                 for i in range(num_splits)
             ]
 
@@ -682,6 +688,9 @@ class TextFileDispatcher(FileDispatcher):
 
         if read_kwargs["chunksize"] is not None:
             return (False, "`chunksize` parameter is not supported")
+
+        if read_kwargs.get("iterator"):
+            return (False, "`iterator==True` parameter is not supported")
 
         if read_kwargs.get("dialect") is not None:
             return (False, "`dialect` parameter is not supported")
@@ -924,23 +933,17 @@ class TextFileDispatcher(FileDispatcher):
         new_query_compiler : BaseQueryCompiler
             New query compiler, created from `new_frame`.
         """
-        new_index, row_lengths = cls._define_index(index_ids, index_name)
-        # Compose modin partitions from `partition_ids`
-        partition_ids = cls.build_partition(partition_ids, row_lengths, column_widths)
-
-        # Compute dtypes by collecting and combining all of the partition dtypes. The
-        # reported dtypes from differing rows can be different based on the inference in
-        # the limited data seen by each worker. We use pandas to compute the exact dtype
-        # over the whole column for each column. The index is set below.
-        dtypes = cls.get_dtypes(dtypes_ids, column_names)
+        partition_ids = cls.build_partition(
+            partition_ids, [None] * len(index_ids), column_widths
+        )
 
         new_frame = cls.frame_cls(
             partition_ids,
-            new_index,
+            lambda: cls._define_index(index_ids, index_name),
             column_names,
-            row_lengths,
+            None,
             column_widths,
-            dtypes=dtypes,
+            dtypes=lambda: cls.get_dtypes(dtypes_ids, column_names),
         )
         new_query_compiler = cls.query_compiler_cls(new_frame)
         skipfooter = kwargs.get("skipfooter", None)
@@ -1000,6 +1003,7 @@ class TextFileDispatcher(FileDispatcher):
         new_query_compiler : BaseQueryCompiler
             Query compiler with imported data for further processing.
         """
+        filepath_or_buffer = stringify_path(filepath_or_buffer)
         filepath_or_buffer_md = (
             cls.get_path(filepath_or_buffer)
             if isinstance(filepath_or_buffer, str)
@@ -1111,6 +1115,14 @@ class TextFileDispatcher(FileDispatcher):
             if can_compute_metadata_while_skipping_rows:
                 pd_df_metadata = pd_df_metadata_temp
 
+        # compute dtypes if possible
+        common_dtypes = None
+        if kwargs["dtype"] is None:
+            most_common_dtype = (object,)
+            common_dtypes = {}
+            for col, dtype in pd_df_metadata.dtypes.to_dict().items():
+                if dtype in most_common_dtype:
+                    common_dtypes[col] = dtype
         column_names = pd_df_metadata.columns
         column_widths, num_splits = cls._define_metadata(pd_df_metadata, column_names)
         # kwargs that will be passed to the workers
@@ -1123,6 +1135,7 @@ class TextFileDispatcher(FileDispatcher):
             skiprows=None,
             nrows=None,
             compression=compression_infered,
+            common_dtypes=common_dtypes,
         )
         # this is done mostly for performance; see PR#5678 for details
         filepath_or_buffer_md_ref = cls.put(filepath_or_buffer_md)

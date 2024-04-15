@@ -13,12 +13,9 @@
 
 """Module houses class that implements ``BaseIO`` using Dask as an execution engine."""
 
-import os
+from distributed.client import default_client
 
-import pandas
-
-from modin.core.io import BaseIO
-from modin.core.storage_formats.pandas.query_compiler import PandasQueryCompiler
+from modin.core.execution.dask.common import DaskWrapper
 from modin.core.execution.dask.implementations.pandas_on_dask.dataframe import (
     PandasOnDaskDataframe,
 )
@@ -26,22 +23,45 @@ from modin.core.execution.dask.implementations.pandas_on_dask.partitioning impor
     PandasOnDaskDataframePartition,
 )
 from modin.core.io import (
+    BaseIO,
     CSVDispatcher,
+    ExcelDispatcher,
+    FeatherDispatcher,
+    FWFDispatcher,
     JSONDispatcher,
     ParquetDispatcher,
-    FeatherDispatcher,
     SQLDispatcher,
-    ExcelDispatcher,
 )
 from modin.core.storage_formats.pandas.parsers import (
     PandasCSVParser,
+    PandasExcelParser,
+    PandasFeatherParser,
+    PandasFWFParser,
     PandasJSONParser,
     PandasParquetParser,
-    PandasFeatherParser,
     PandasSQLParser,
-    PandasExcelParser,
 )
-from modin.core.execution.dask.common import DaskWrapper
+from modin.core.storage_formats.pandas.query_compiler import PandasQueryCompiler
+from modin.distributed.dataframe.pandas.partitions import (
+    from_partitions,
+    unwrap_partitions,
+)
+from modin.experimental.core.io import (
+    ExperimentalCSVGlobDispatcher,
+    ExperimentalCustomTextDispatcher,
+    ExperimentalGlobDispatcher,
+    ExperimentalSQLDispatcher,
+)
+from modin.experimental.core.storage_formats.pandas.parsers import (
+    ExperimentalCustomTextParser,
+    ExperimentalPandasCSVGlobParser,
+    ExperimentalPandasJsonParser,
+    ExperimentalPandasParquetParser,
+    ExperimentalPandasPickleParser,
+    ExperimentalPandasXmlParser,
+)
+from modin.pandas.series import Series
+from modin.utils import MODIN_UNNAMED_SERIES_LABEL
 
 
 class PandasOnDaskIO(BaseIO):
@@ -53,98 +73,118 @@ class PandasOnDaskIO(BaseIO):
         frame_cls=PandasOnDaskDataframe,
         frame_partition_cls=PandasOnDaskDataframePartition,
         query_compiler_cls=PandasQueryCompiler,
+        base_io=BaseIO,
     )
 
-    read_csv = type("", (DaskWrapper, PandasCSVParser, CSVDispatcher), build_args).read
-    read_json = type(
-        "", (DaskWrapper, PandasJSONParser, JSONDispatcher), build_args
-    ).read
-    read_parquet = type(
-        "", (DaskWrapper, PandasParquetParser, ParquetDispatcher), build_args
-    ).read
-    # Blocked on pandas-dev/pandas#12236. It is faster to default to pandas.
-    # read_hdf = type("", (DaskWrapper, PandasHDFParser, HDFReader), build_args).read
-    read_feather = type(
-        "", (DaskWrapper, PandasFeatherParser, FeatherDispatcher), build_args
-    ).read
-    read_sql = type("", (DaskWrapper, PandasSQLParser, SQLDispatcher), build_args).read
-    read_excel = type(
-        "", (DaskWrapper, PandasExcelParser, ExcelDispatcher), build_args
-    ).read
+    def __make_read(*classes, build_args=build_args):
+        # used to reduce code duplication
+        return type("", (DaskWrapper, *classes), build_args).read
 
-    @staticmethod
-    def _to_parquet_check_support(kwargs):
+    def __make_write(*classes, build_args=build_args):
+        # used to reduce code duplication
+        return type("", (DaskWrapper, *classes), build_args).write
+
+    read_csv = __make_read(PandasCSVParser, CSVDispatcher)
+    read_fwf = __make_read(PandasFWFParser, FWFDispatcher)
+    read_json = __make_read(PandasJSONParser, JSONDispatcher)
+    read_parquet = __make_read(PandasParquetParser, ParquetDispatcher)
+    to_parquet = __make_write(ParquetDispatcher)
+    # Blocked on pandas-dev/pandas#12236. It is faster to default to pandas.
+    # read_hdf = __make_read(PandasHDFParser, HDFReader)
+    read_feather = __make_read(PandasFeatherParser, FeatherDispatcher)
+    read_sql = __make_read(PandasSQLParser, SQLDispatcher)
+    to_sql = __make_write(SQLDispatcher)
+    read_excel = __make_read(PandasExcelParser, ExcelDispatcher)
+
+    # experimental methods that don't exist in pandas
+    read_csv_glob = __make_read(
+        ExperimentalPandasCSVGlobParser, ExperimentalCSVGlobDispatcher
+    )
+    read_parquet_glob = __make_read(
+        ExperimentalPandasParquetParser, ExperimentalGlobDispatcher
+    )
+    to_parquet_glob = __make_write(
+        ExperimentalGlobDispatcher,
+        build_args={**build_args, "base_write": BaseIO.to_parquet},
+    )
+    read_json_glob = __make_read(
+        ExperimentalPandasJsonParser, ExperimentalGlobDispatcher
+    )
+    to_json_glob = __make_write(
+        ExperimentalGlobDispatcher,
+        build_args={**build_args, "base_write": BaseIO.to_json},
+    )
+    read_xml_glob = __make_read(ExperimentalPandasXmlParser, ExperimentalGlobDispatcher)
+    to_xml_glob = __make_write(
+        ExperimentalGlobDispatcher,
+        build_args={**build_args, "base_write": BaseIO.to_xml},
+    )
+    read_pickle_glob = __make_read(
+        ExperimentalPandasPickleParser, ExperimentalGlobDispatcher
+    )
+    to_pickle_glob = __make_write(
+        ExperimentalGlobDispatcher,
+        build_args={**build_args, "base_write": BaseIO.to_pickle},
+    )
+    read_custom_text = __make_read(
+        ExperimentalCustomTextParser, ExperimentalCustomTextDispatcher
+    )
+    read_sql_distributed = __make_read(
+        ExperimentalSQLDispatcher, build_args={**build_args, "base_read": read_sql}
+    )
+
+    del __make_read  # to not pollute class namespace
+    del __make_write  # to not pollute class namespace
+
+    @classmethod
+    def from_dask(cls, dask_obj):
         """
-        Check if parallel version of `to_parquet` could be used.
+        Create a Modin `query_compiler` from a Dask DataFrame.
 
         Parameters
         ----------
-        kwargs : dict
-            Keyword arguments passed to `.to_parquet()`.
+        dask_obj : dask.dataframe.DataFrame
+            The Dask DataFrame to convert from.
 
         Returns
         -------
-        bool
-            Whether parallel version of `to_parquet` is applicable.
+        BaseQueryCompiler
+            QueryCompiler containing data from the Dask DataFrame.
         """
-        path = kwargs["path"]
-        compression = kwargs["compression"]
-        if not isinstance(path, str):
-            return False
-        if any((path.endswith(ext) for ext in [".gz", ".bz2", ".zip", ".xz"])):
-            return False
-        if compression is None or not compression == "snappy":
-            return False
-        return True
+        client = default_client()
+        dask_fututures = client.compute(dask_obj.to_delayed())
+        modin_df = from_partitions(dask_fututures, axis=0)._query_compiler
+        return modin_df
 
     @classmethod
-    def to_parquet(cls, qc, **kwargs):
+    def to_dask(cls, modin_obj):
         """
-        Write a ``DataFrame`` to the binary parquet format.
+        Convert a Modin DataFrame/Series to a Dask DataFrame/Series.
 
         Parameters
         ----------
-        qc : BaseQueryCompiler
-            The query compiler of the Modin dataframe that we want to run `to_parquet` on.
-        **kwargs : dict
-            Parameters for `pandas.to_parquet(**kwargs)`.
+        modin_obj : modin.pandas.DataFrame, modin.pandas.Series
+            The Modin DataFrame/Series to convert.
+
+        Returns
+        -------
+        dask.dataframe.DataFrame or dask.dataframe.Series
+            Converted object with type depending on input.
         """
-        if not cls._to_parquet_check_support(kwargs):
-            return BaseIO.to_parquet(qc, **kwargs)
+        from dask.dataframe import from_delayed
 
-        output_path = kwargs["path"]
-        os.makedirs(output_path, exist_ok=True)
+        partitions = unwrap_partitions(modin_obj, axis=0)
 
-        def func(df, **kw):
-            """
-            Dump a chunk of rows as parquet, then save them to target maintaining order.
+        # partiotions must be converted to pandas Series
+        if isinstance(modin_obj, Series):
+            client = default_client()
 
-            Parameters
-            ----------
-            df : pandas.DataFrame
-                A chunk of rows to write to a parquet file.
-            **kw : dict
-                Arguments to pass to ``pandas.to_parquet(**kwargs)`` plus an extra argument
-                `partition_idx` serving as chunk index to maintain rows order.
-            """
-            compression = kwargs["compression"]
-            partition_idx = kw["partition_idx"]
-            kwargs[
-                "path"
-            ] = f"{output_path}/part-{partition_idx:04d}.{compression}.parquet"
-            df.to_parquet(**kwargs)
-            return pandas.DataFrame()
+            def df_to_series(df):
+                series = df[df.columns[0]]
+                if df.columns[0] == MODIN_UNNAMED_SERIES_LABEL:
+                    series.name = None
+                return series
 
-        # Ensure that the metadata is synchronized
-        qc._modin_frame._propagate_index_objs(axis=None)
-        result = qc._modin_frame._partition_mgr_cls.map_axis_partitions(
-            axis=1,
-            partitions=qc._modin_frame._partitions,
-            map_func=func,
-            keep_partitioning=True,
-            lengths=None,
-            enumerate_partitions=True,
-        )
-        DaskWrapper.materialize(
-            [part.list_of_blocks[0] for row in result for part in row]
-        )
+            partitions = [client.submit(df_to_series, part) for part in partitions]
+
+        return from_delayed(partitions)

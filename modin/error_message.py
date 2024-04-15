@@ -11,8 +11,9 @@
 # ANY KIND, either express or implied. See the License for the specific language
 # governing permissions and limitations under the License.
 
-from typing import NoReturn, Set
 import warnings
+from typing import NoReturn, Set
+
 from modin.logging import get_logger
 from modin.utils import get_current_execution
 
@@ -100,13 +101,17 @@ class ErrorMessage(object):
         )
 
     @classmethod
-    def missmatch_with_pandas(cls, operation: str, message: str) -> None:
+    def mismatch_with_pandas(cls, operation: str, message: str) -> None:
         get_logger().debug(
             f"Modin Warning: {operation} mismatch with pandas: {message}"
         )
         cls.single_warning(
             f"`{operation}` implementation has mismatches with pandas:\n{message}."
         )
+
+    @classmethod
+    def warn(cls, message: str) -> None:
+        warnings.warn(message)
 
     @classmethod
     def not_initialized(cls, engine: str, code: str) -> None:

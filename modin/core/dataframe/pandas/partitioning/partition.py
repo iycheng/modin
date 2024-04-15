@@ -13,21 +13,23 @@
 
 """The module defines base interface for a partition of a Modin DataFrame."""
 
-from abc import ABC
-from copy import copy
 import logging
 import uuid
+from abc import ABC
+from copy import copy
 
 import pandas
 from pandas.api.types import is_scalar
 from pandas.util import cache_readonly
 
-from modin.pandas.indexing import compute_sliced_len
 from modin.core.storage_formats.pandas.utils import length_fn_pandas, width_fn_pandas
-from modin.logging import get_logger
+from modin.logging import ClassLogger, get_logger
+from modin.pandas.indexing import compute_sliced_len
 
 
-class PandasDataframePartition(ABC):  # pragma: no cover
+class PandasDataframePartition(
+    ABC, ClassLogger, modin_layer="BLOCK-PARTITION"
+):  # pragma: no cover
     """
     An abstract class that is base for any partition class of ``pandas`` storage format.
 
@@ -38,6 +40,24 @@ class PandasDataframePartition(ABC):  # pragma: no cover
     _width_cache = None
     _identity_cache = None
     _data = None
+    execution_wrapper = None
+
+    # these variables are intentionally initialized at runtime
+    # so as not to initialize the engine during import
+    _iloc_func = None
+
+    def __init__(self):
+        if type(self)._iloc_func is None:
+            # Places `_iloc` function into the storage to speed up
+            # remote function calls and caches the result.
+            # It also postpones engine initialization, which happens
+            # implicitly when `execution_wrapper.put` is called.
+            if self.execution_wrapper is not None:
+                type(self)._iloc_func = staticmethod(
+                    self.execution_wrapper.put(self._iloc)
+                )
+            else:
+                type(self)._iloc_func = staticmethod(self._iloc)
 
     @cache_readonly
     def __constructor__(self):
@@ -191,7 +211,7 @@ class PandasDataframePartition(ABC):  # pragma: no cover
         If the underlying object is a pandas DataFrame, this will return
         a 2D NumPy array.
         """
-        return self.apply(lambda df, **kwargs: df.to_numpy(**kwargs)).get()
+        return self.apply(lambda df: df.to_numpy(**kwargs)).get()
 
     @staticmethod
     def _iloc(df, row_labels, col_labels):  # noqa: RT01, PR01
@@ -236,7 +256,7 @@ class PandasDataframePartition(ABC):  # pragma: no cover
         ):
             return copy(self)
 
-        new_obj = self.add_to_apply_calls(self._iloc, row_labels, col_labels)
+        new_obj = self.add_to_apply_calls(self._iloc_func, row_labels, col_labels)
 
         def try_recompute_cache(indices, previous_cache):
             """Compute new axis-length cache for the masked frame based on its previous cache."""
